@@ -106,7 +106,7 @@ struct audio_mixer::impl
                     mixed[n] = static_cast<double>(ptr[n]) * item.transform.volume + mixed[n];
                 } else {
                     auto offset = (item.samples.size()) - (channels - (n % channels));
-                    mixed[n]    = static_cast<double>(ptr[offset]) * item.transform.volume + mixed[n];
+                    // mixed[n]    = static_cast<double>(ptr[offset]) * item.transform.volume + mixed[n];
                 }
             }
         }
