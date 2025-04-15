@@ -104,10 +104,11 @@ struct audio_mixer::impl
             for (auto n = 0; n < size; ++n) {
                 if (n < item.samples.size()) {
                     mixed[n] = static_cast<double>(ptr[n]) * item.transform.volume + mixed[n];
-                } else {
-                    auto offset = (item.samples.size()) - (channels - (n % channels));
-                    // mixed[n]    = static_cast<double>(ptr[offset]) * item.transform.volume + mixed[n];
                 }
+                //  else {
+                //     auto offset = (item.samples.size()) - (channels - (n % channels));
+                //     mixed[n]    = static_cast<double>(ptr[offset]) * item.transform.volume + mixed[n];
+                // }
             }
         }
 
