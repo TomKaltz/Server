@@ -25,7 +25,7 @@
 #include <core/frame/frame_visitor.h>
 #include <core/frame/frame_transform.h>
 #include <core/frame/draw_frame.h>
-#include <core/frame/const_frame.h>
+#include "../../frame/const_frame.h"
 #include <core/video_format_desc.h>
 #include <common/timer.h>
 #include <common/spl.h>
