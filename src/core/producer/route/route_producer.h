@@ -22,11 +22,18 @@
 #pragma once
 
 #include <core/producer/frame_producer.h>
+#include <core/frame/frame_visitor.h>
 
 #include <string>
 #include <vector>
+#include <memory>
+#include <boost/signals2.hpp>
 
 namespace caspar { namespace core {
+
+class route;
+class frame_factory;
+class video_format_desc;
 
 class route_control
 {
@@ -81,27 +88,16 @@ class route_producer
     }
 
   public:
-    route_producer(std::shared_ptr<route> route, video_format_desc format_desc, int buffer, int source_channel, int source_layer, const spl::shared_ptr<frame_factory>& frame_factory)
-        : route_(route)
-        , format_desc_(format_desc)
-        , source_channel_(source_channel)
-        , source_layer_(source_layer)
-        , tag_fix_(this)
-        , frame_factory_(frame_factory)
-    {
-        graph_ = spl::make_shared<diagnostics::graph>();
-        buffer_.set_capacity(buffer > 0 ? buffer : 1);
-
-        graph_->set_color("late-frame", diagnostics::color(0.6f, 0.3f, 0.3f));
-        graph_->set_color("produce-time", caspar::diagnostics::color(0.0f, 1.0f, 0.0f));
-        graph_->set_color("consume-time", caspar::diagnostics::color(1.0f, 0.4f, 0.0f, 0.8f));
-        graph_->set_color("dropped-frame", diagnostics::color(0.3f, 0.6f, 0.3f));
-        graph_->set_text(print());
-     
-        CASPAR_LOG(debug) << print() << L" Initialized";
-    }
-
+    route_producer(std::shared_ptr<route> route, video_format_desc format_desc, int buffer, int source_channel, int source_layer, const spl::shared_ptr<frame_factory>& frame_factory);
     virtual ~route_producer() {}
+
+    void connect_slot();
+    draw_frame last_frame(const core::video_field field) override;
+    draw_frame receive_impl(core::video_field field, int nb_samples) override;
+    bool is_ready() override { return true; }
+    std::wstring print() const override { return L"route[" + route_->name + L"]"; }
+    std::wstring name() const override { return L"route"; }
+    core::monitor::state state() const override;
 };
 
 spl::shared_ptr<core::frame_producer> create_route_producer(const core::frame_producer_dependencies& dependencies,

@@ -32,6 +32,7 @@
 #include <core/producer/frame_producer.h>
 #include <core/video_channel.h>
 #include <core/diagnostics/osd_graph.h>
+#include <core/route.h>
 
 #include <boost/regex.hpp>
 #include <boost/signals2.hpp>
@@ -153,12 +154,13 @@ class route_producer
     }
 
   public:
-    route_producer(std::shared_ptr<route> route, video_format_desc format_desc, int buffer, int source_channel, int source_layer)
+    route_producer(std::shared_ptr<route> route, video_format_desc format_desc, int buffer, int source_channel, int source_layer, const spl::shared_ptr<frame_factory>& frame_factory)
         : route_(route)
         , format_desc_(format_desc)
         , source_channel_(source_channel)
         , source_layer_(source_layer)
         , tag_fix_(this)
+        , frame_factory_(frame_factory)
     {
         graph_ = spl::make_shared<diagnostics::graph>();
         buffer_.set_capacity(buffer > 0 ? buffer : 1);
