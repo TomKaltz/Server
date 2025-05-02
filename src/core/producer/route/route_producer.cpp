@@ -31,11 +31,13 @@
 #include <core/monitor/monitor.h>
 #include <core/producer/frame_producer.h>
 #include <core/video_channel.h>
+#include <core/diagnostics/osd_graph.h>
 
 #include <boost/regex.hpp>
 #include <boost/signals2.hpp>
 
 #include <tbb/concurrent_queue.h>
+#include <SFML/Graphics.hpp>
 
 #include <optional>
 #include <stack>
@@ -247,15 +249,77 @@ class route_producer
         graph_->set_value("consume-time", consume_timer_.elapsed() * route_->format_desc.fps * 0.5);
         consume_timer_.restart();
 
+        // Update state with frame information
+        state_["frame/field"] = field == core::video_field::a ? "a" : (field == core::video_field::b ? "b" : "progressive");
+        state_["frame/time"] = consume_timer_.elapsed() * route_->format_desc.fps * 0.5;
+        state_["frame/buffer"] = buffer_.size();
+        if (frame_) {
+            state_["frame/ready"] = true;
+        }
+
         if (!frame_) {
             return core::draw_frame{};
         }
 
-        if (field == core::video_field::b) {
-            return frame_->second;
+        // Create frame info text
+        std::wstring info_text = L"Route: " + route_->name + L"\n";
+        info_text += L"Producer: " + print() + L"\n";
+        
+        if (source_layer_ >= 0) {
+            // Layer route
+            info_text += L"Layer: " + std::to_wstring(source_layer_) + L"\n";
+            if (auto layer = route_->get_layer(source_layer_)) {
+                if (auto producer = layer->foreground()) {
+                    info_text += L"Foreground: " + producer->print() + L"\n";
+                }
+                if (auto producer = layer->background()) {
+                    info_text += L"Background: " + producer->print() + L"\n";
+                }
+            }
         } else {
-            return frame_->first;
+            // Channel route
+            info_text += L"Channel: " + std::to_wstring(source_channel_) + L"\n";
         }
+        
+        info_text += L"Field: " + (field == core::video_field::a ? L"A" : (field == core::video_field::b ? L"B" : L"Progressive")) + L"\n";
+        info_text += L"Buffer: " + std::to_wstring(buffer_.size()) + L"\n";
+        info_text += L"Time: " + std::to_wstring(consume_timer_.elapsed() * route_->format_desc.fps * 0.5);
+
+        // Create text texture
+        sf::RenderTexture text_texture;
+        if (!text_texture.create(format_desc_.width, format_desc_.height)) {
+            CASPAR_LOG(error) << L"Failed to create text texture";
+            return field == core::video_field::b ? frame_->second : frame_->first;
+        }
+        text_texture.clear(sf::Color::Transparent);
+
+        sf::Text text(info_text, diagnostics::osd::get_default_font(), 24);
+        text.setFillColor(sf::Color::White);
+        text.setPosition(10, 10);
+        text_texture.draw(text);
+        text_texture.display();
+
+        // Get the text texture data
+        sf::Image text_image = text_texture.getTexture().copyToImage();
+        const uint8_t* pixels = text_image.getPixelsPtr();
+
+        // Create a frame with the text texture data
+        core::pixel_format_desc desc(core::pixel_format::bgra);
+        desc.planes.push_back(core::pixel_format_desc::plane(format_desc_.width, format_desc_.height, 4));
+        auto text_frame = frame_factory_->create_frame(this, desc);
+        if (!text_frame) {
+            CASPAR_LOG(error) << L"Failed to create text frame";
+            return field == core::video_field::b ? frame_->second : frame_->first;
+        }
+
+        // Copy the text texture data to the frame
+        std::memcpy(text_frame.image_data(0).begin(), pixels, format_desc_.width * format_desc_.height * 4);
+
+        // Get the main frame
+        auto main_frame = field == core::video_field::b ? frame_->second : frame_->first;
+
+        // Overlay the text on the main frame
+        return core::draw_frame::over(main_frame, core::draw_frame(std::move(text_frame)));
     }
 
     bool is_ready() override { return true; }
@@ -308,9 +372,11 @@ spl::shared_ptr<core::frame_producer> create_route_producer(const core::frame_pr
     }
 
     auto buffer = get_param(L"BUFFER", params, 0);
-    auto rp     = spl::make_shared<route_producer>((*channel_it)->route(layer, mode), dependencies.format_desc, buffer, channel, layer);
+    auto rp     = spl::make_shared<route_producer>((*channel_it)->route(layer, mode), dependencies.format_desc, buffer, channel, layer, dependencies.frame_factory);
     rp->connect_slot();
     return rp;
 }
 
 }} // namespace caspar::core
+
+
