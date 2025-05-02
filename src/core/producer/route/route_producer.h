@@ -23,17 +23,88 @@
 
 #include <core/producer/frame_producer.h>
 #include <core/frame/frame_visitor.h>
+#include <core/frame/frame_transform.h>
+#include <core/frame/draw_frame.h>
+#include <core/frame/const_frame.h>
+#include <core/video_format_desc.h>
+#include <common/timer.h>
+#include <common/spl.h>
+#include <core/monitor/monitor.h>
+#include <core/diagnostics/graph.h>
+#include <core/frame/frame_factory.h>
 
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
+#include <stack>
 #include <boost/signals2.hpp>
+#include <tbb/concurrent_queue.h>
 
 namespace caspar { namespace core {
 
 class route;
 class frame_factory;
 class video_format_desc;
+
+class fix_stream_tag : public frame_visitor
+{
+    const void*                                                route_producer_ptr_;
+    std::stack<std::pair<frame_transform, std::vector<draw_frame>>> frames_stack_;
+    std::optional<const_frame>                                 upd_frame_;
+    
+    fix_stream_tag(const fix_stream_tag&);
+    fix_stream_tag& operator=(const fix_stream_tag&);
+
+  public:
+    fix_stream_tag(void* stream_tag)
+        : route_producer_ptr_(stream_tag)
+    {
+        frames_stack_ = std::stack<std::pair<frame_transform, std::vector<draw_frame>>>();
+        frames_stack_.emplace(frame_transform{}, std::vector<draw_frame>());
+    }
+
+    void push(const frame_transform& transform) {
+        frames_stack_.emplace(transform, std::vector<core::draw_frame>());
+    }
+
+    void visit(const const_frame& frame) {
+        const void* source_tag = frame.stream_tag();
+        intptr_t base_addr = reinterpret_cast<intptr_t>(route_producer_ptr_);
+        intptr_t source_addr = reinterpret_cast<intptr_t>(source_tag);
+        intptr_t unique_value = base_addr ^ source_addr ^ 0xDEADBEEF; 
+        const void* unique_tag = reinterpret_cast<const void*>(unique_value);
+        upd_frame_ = frame.with_tag(unique_tag);
+    }
+
+    void pop() {
+        auto popped = frames_stack_.top();
+        frames_stack_.pop();
+
+        if (upd_frame_ != std::nullopt) {
+            auto new_frame        = draw_frame(std::move(*upd_frame_));
+            upd_frame_            = std::nullopt;
+            new_frame.transform() = popped.first;
+            frames_stack_.top().second.push_back(std::move(new_frame));
+        } else {
+            auto new_frame        = draw_frame(std::move(popped.second));
+            new_frame.transform() = popped.first;
+            frames_stack_.top().second.push_back(new_frame);
+        }
+    }
+
+    draw_frame operator()(draw_frame frame) {
+        frame.accept(*this);
+
+        auto popped = frames_stack_.top();
+        frames_stack_.pop();
+        draw_frame result = draw_frame(std::move(popped.second));
+
+        frames_stack_ = std::stack<std::pair<frame_transform, std::vector<draw_frame>>>();
+        frames_stack_.emplace(frame_transform{}, std::vector<draw_frame>());
+        return result;
+    }
+};
 
 class route_control
 {
@@ -74,7 +145,6 @@ class route_producer
     int get_source_channel() const override { return source_channel_; }
     int get_source_layer() const override { return source_layer_; }
 
-    // set the buffer depth to 2 for cross-channel routes, 1 otherwise
     void set_cross_channel(bool cross) override
     {
         is_cross_channel_ = cross;
@@ -95,7 +165,7 @@ class route_producer
     draw_frame last_frame(const core::video_field field) override;
     draw_frame receive_impl(core::video_field field, int nb_samples) override;
     bool is_ready() override { return true; }
-    std::wstring print() const override { return L"route[" + route_->name + L"]"; }
+    std::wstring print() const override;
     std::wstring name() const override { return L"route"; }
     core::monitor::state state() const override;
 };
