@@ -737,7 +737,7 @@ class decklink_producer : public IDeckLinkInputCallback
                     auto av_audio = alloc_frame();
 
                     // TODO (fix) this may get stuck if the decklink sends a frame of video or audio
-
+                    audio_filter_.sink->inputs[0]->min_samples = audio_cadence_[0];
                     if (av_buffersink_get_frame_flags(video_filter_.sink, av_video.get(), AV_BUFFERSINK_FLAG_PEEK) <
                         0) {
                         return S_OK;
