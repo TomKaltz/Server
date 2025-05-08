@@ -361,11 +361,20 @@ struct Decoder
                 frame->height      = video->GetHeight();
                 frame->data[0]     = reinterpret_cast<uint8_t*>(video_bytes);
                 frame->linesize[0] = video->GetRowBytes();
-                frame->key_frame   = 1;
+#if LIBAVCODEC_VERSION_MAJOR < 61
+                frame->key_frame = 1;
+#else
+                frame->flags |= AV_FRAME_FLAG_KEY;
+#endif
             }
 
+#if LIBAVCODEC_VERSION_MAJOR < 61
             frame->interlaced_frame = mode->GetFieldDominance() != bmdProgressiveFrame;
             frame->top_field_first  = mode->GetFieldDominance() == bmdUpperFieldFirst ? 1 : 0;
+#else
+            frame->flags |= mode->GetFieldDominance() != bmdProgressiveFrame ? AV_FRAME_FLAG_INTERLACED : 0;
+            frame->flags |= mode->GetFieldDominance() == bmdUpperFieldFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0;
+#endif
 
             return frame;
         }
@@ -731,6 +740,7 @@ class decklink_producer : public IDeckLinkInputCallback
                 }
             }
 
+            av_buffersink_set_frame_size(audio_filter_.sink, audio_cadence_[0]);
             while (true) {
                 {
                     auto av_video = alloc_frame();
