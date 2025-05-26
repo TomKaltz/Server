@@ -49,6 +49,7 @@ class frame_producer
     core::draw_frame last_frame_;
     core::draw_frame first_frame_;
     bool             is_ready_ = false;
+    std::wstring     uid_;
 
   public:
     static const spl::shared_ptr<frame_producer>& empty();
@@ -112,6 +113,10 @@ class frame_producer
      * While this returns false, the previous producer will be left running for a limited number of frames.
      */
     virtual bool is_ready() = 0;
+
+    // UID support
+    void set_uid(const std::wstring& uid) { uid_ = uid; }
+    const std::wstring& uid() const { return uid_; }
 };
 
 class const_producer : public core::frame_producer

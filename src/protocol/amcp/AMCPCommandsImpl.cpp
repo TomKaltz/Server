@@ -282,6 +282,7 @@ std::wstring loadbg_command(command_context& ctx)
 
     auto channel   = ctx.channel.raw_channel;
     bool auto_play = contains_param(L"AUTO", ctx.parameters);
+    auto uid       = get_param(L"UID", ctx.parameters, L"");
 
     try {
         auto new_producer = ctx.static_context->producer_registry->create_producer(
@@ -289,6 +290,11 @@ std::wstring loadbg_command(command_context& ctx)
 
         if (new_producer == frame_producer::empty())
             CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(!ctx.parameters.empty() ? ctx.parameters[0] : L""));
+
+        // Set UID on the producer if provided
+        if (!uid.empty()) {
+            new_producer->set_uid(uid);
+        }
 
         spl::shared_ptr<frame_producer> transition_producer = frame_producer::empty();
         transition_info                 transitionInfo;
@@ -306,6 +312,11 @@ std::wstring loadbg_command(command_context& ctx)
             // Try other transitions
             try_match_transition(message, transitionInfo);
             transition_producer = create_transition_producer(new_producer, transitionInfo);
+        }
+
+        // Copy UID from the original producer to the transition producer
+        if (!uid.empty()) {
+            transition_producer->set_uid(uid);
         }
 
         // TODO - we should pass the format into load(), so that we can catch it having changed since the producer was
@@ -332,10 +343,23 @@ std::wstring load_command(command_context& ctx)
         // Must be a promoting load
         ctx.channel.stage->preview(ctx.layer_index());
     } else {
+        auto uid = get_param(L"UID", ctx.parameters, L"");
+        
         try {
             auto new_producer = ctx.static_context->producer_registry->create_producer(
                 get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
+            
+            // Set UID on the producer if provided
+            if (!uid.empty()) {
+                new_producer->set_uid(uid);
+            }
+            
             auto transition_producer = create_transition_producer(new_producer, transition_info{});
+
+            // Copy UID from the original producer to the transition producer
+            if (!uid.empty()) {
+                transition_producer->set_uid(uid);
+            }
 
             ctx.channel.stage->load(ctx.layer_index(), transition_producer, true);
         } catch (file_not_found&) {

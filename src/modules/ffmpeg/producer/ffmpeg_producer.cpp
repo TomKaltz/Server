@@ -63,7 +63,6 @@ struct ffmpeg_producer : public core::frame_producer
     const std::wstring                   filename_;
     spl::shared_ptr<core::frame_factory> frame_factory_;
     core::video_format_desc              format_desc_;
-    const std::wstring                   uid_;
 
     std::shared_ptr<AVProducer> producer_;
 
@@ -79,12 +78,10 @@ struct ffmpeg_producer : public core::frame_producer
                              std::optional<int64_t>               duration,
                              std::optional<bool>                  loop,
                              int                                  seekable,
-                             core::frame_geometry::scale_mode     scale_mode,
-                             std::wstring                         uid)
+                             core::frame_geometry::scale_mode     scale_mode)
         : filename_(filename)
         , frame_factory_(frame_factory)
         , format_desc_(format_desc)
-        , uid_(uid)
         , producer_(new AVProducer(frame_factory_,
                                    format_desc_,
                                    u8(path),
@@ -209,7 +206,6 @@ struct ffmpeg_producer : public core::frame_producer
     core::monitor::state state() const override
     {
         auto st = producer_->state();
-        st["uid"] = uid_;
         return st;
     }
 };
@@ -351,7 +347,6 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
 
     auto vfilter = get_param(L"VF", params, filter_str);
     auto afilter = get_param(L"AF", params, get_param(L"FILTER", params, L""));
-    auto uid     = get_param(L"UID", params, L"");
 
     try {
         // Use std::make_shared and wrap into spl::shared_ptr since spl::make_shared supports only up to 12 args
@@ -366,8 +361,7 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
                                                      duration,
                                                      loop,
                                                      seekable,
-                                                     scale_mode,
-                                                     uid);
+                                                     scale_mode);
         return spl::shared_ptr<core::frame_producer>(ptr);
     } catch (...) {
         CASPAR_LOG_CURRENT_EXCEPTION();

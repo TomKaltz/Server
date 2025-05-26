@@ -132,6 +132,7 @@ struct layer::impl
             state_["foreground"]             = foreground_->state();
             state_["foreground"]["producer"] = foreground_->name();
             state_["foreground"]["paused"]   = paused_;
+            state_["foreground"]["uid"]      = foreground_->uid();
 
             if (frames_left > 0) {
                 state_["foreground"]["frames_left"] = frames_left;
@@ -139,6 +140,7 @@ struct layer::impl
 
             state_["background"]             = background_->state();
             state_["background"]["producer"] = background_->name();
+            state_["background"]["uid"]      = background_->uid();
 
             return frame;
         } catch (...) {
