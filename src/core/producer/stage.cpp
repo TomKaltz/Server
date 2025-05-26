@@ -545,7 +545,7 @@ std::future<frame_transform> stage_delayed::get_current_transform(int index)
 std::future<void>
 stage_delayed::load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play)
 {
-    return executor_.begin_invoke([=] { return stage_->load(index, producer, preview, auto_play); });
+    return executor_.begin_invoke([=] { return stage_->load(index, producer, preview, auto_play).get(); });
 }
 std::future<void> stage_delayed::preview(int index)
 {
