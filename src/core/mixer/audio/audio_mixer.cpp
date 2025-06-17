@@ -141,6 +141,60 @@ struct audio_mixer::impl
             auto item_size = item.samples.size();
             auto dst_size  = result.size();
 
+            // Apply audio channel remap if configured
+            std::vector<int32_t> remapped_samples;
+            const int32_t* processed_ptr = ptr;
+            size_t processed_size = item_size;
+            
+            if (!item.transform.audio_channel_map.empty()) {
+                int source_channels = channels_;
+                int target_channels = static_cast<int>(item.transform.audio_channel_map.size());
+                
+                if (target_channels > 0) {
+                    // Always remap to the output format's channel count
+                    target_channels = channels_;
+                    
+                    // Calculate samples per channel
+                    int samples_per_channel = static_cast<int>(item_size) / source_channels;
+                    if (samples_per_channel > 0) {
+                        remapped_samples.reserve(samples_per_channel * target_channels);
+                        
+                        for (int sample = 0; sample < samples_per_channel; ++sample) {
+                            for (int target_ch = 0; target_ch < target_channels; ++target_ch) {
+                                int source_ch = 0;
+                                
+                                // Use the remap if available for this target channel
+                                if (target_ch < static_cast<int>(item.transform.audio_channel_map.size())) {
+                                    source_ch = item.transform.audio_channel_map[target_ch];
+                                } else {
+                                    // If no mapping for this target channel, use silence
+                                    source_ch = 0;
+                                }
+                                
+                                if (source_ch == 0) {
+                                    // Silence
+                                    remapped_samples.push_back(0);
+                                } else if (source_ch <= source_channels) {
+                                    // Map from source channel (1-based to 0-based)
+                                    int source_idx = sample * source_channels + (source_ch - 1);
+                                    if (source_idx < static_cast<int>(item_size)) {
+                                        remapped_samples.push_back(ptr[source_idx]);
+                                    } else {
+                                        remapped_samples.push_back(0);
+                                    }
+                                } else {
+                                    // Invalid source channel, use silence
+                                    remapped_samples.push_back(0);
+                                }
+                            }
+                        }
+                        
+                        processed_ptr = remapped_samples.data();
+                        processed_size = remapped_samples.size();
+                    }
+                }
+            }
+
             size_t last_size = 0;
             const int32_t* last_ptr = nullptr;
             
@@ -164,16 +218,16 @@ struct audio_mixer::impl
                 
                 if (last_ptr && n < last_size) {
                     sample_value = static_cast<double>(last_ptr[n]);
-                } else if (n < last_size + item_size) {
-                    sample_value = static_cast<double>(ptr[n - last_size]);
+                } else if (n < last_size + processed_size) {
+                    sample_value = static_cast<double>(processed_ptr[n - last_size]);
                 } else {
                     // If we run out of samples, hold the last sample value per channel
                     int channel_pos = n % channels_;
-                    int offset = int(item_size) - (channels_ - channel_pos);
+                    int offset = int(processed_size) - (channels_ - channel_pos);
                     if (offset < 0) {
                         offset = channel_pos;
                     }
-                    sample_value = static_cast<double>(ptr[offset]);
+                    sample_value = static_cast<double>(processed_ptr[offset]);
                 }
                 
                 double applied_volume = item.transform.volume;
@@ -197,23 +251,23 @@ struct audio_mixer::impl
             }
 
             if (has_variable_cadence_ && item.tag) {
-                if (item_size + last_size > dst_size) {
+                if (processed_size + last_size > dst_size) {
                     // Calculate remaining samples after mixing the current frame
-                    auto remaining_samples = item_size + last_size - dst_size;
+                    auto remaining_samples = processed_size + last_size - dst_size;
                     
                     // Apply the most restrictive limit and log if needed
-                    if (remaining_samples > max_buffer_size_ || remaining_samples > item_size) {
+                    if (remaining_samples > max_buffer_size_ || remaining_samples > processed_size) {
                         graph_->set_tag(diagnostics::tag_severity::WARNING, "audio-buffer-overflow");
                         
                         // Apply the most restrictive limit
-                        remaining_samples = (max_buffer_size_ < item_size) ? max_buffer_size_ : item_size;
+                        remaining_samples = (max_buffer_size_ < processed_size) ? max_buffer_size_ : processed_size;
                     }
                     
                     std::vector<int32_t> buf(remaining_samples);
                     // Calculate the correct offset in the source buffer
                     size_t offset = (dst_size > last_size) ? (dst_size - last_size) : 0;
-                    if (offset < item_size) {
-                        std::memcpy(buf.data(), ptr + offset, remaining_samples * sizeof(int32_t));
+                    if (offset < processed_size) {
+                        std::memcpy(buf.data(), processed_ptr + offset, remaining_samples * sizeof(int32_t));
                         next_audio_streams[item.tag] = std::move(buf);
                     } else {
                         next_audio_streams[item.tag] = std::vector<int32_t>();

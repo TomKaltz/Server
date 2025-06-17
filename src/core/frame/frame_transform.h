@@ -27,6 +27,7 @@
 
 #include <array>
 #include <optional>
+#include <vector>
 
 namespace caspar { namespace core {
 
@@ -117,6 +118,7 @@ struct audio_transform final
 {
     double volume = 1.0;
     bool   immediate_volume = false;  // When false, intra-frame samples are ramped from previous volume in audio mixer
+    std::vector<int> audio_channel_map;  // Channel remap: each index is target channel, value is 1-based source channel (0 = silence)
 
     audio_transform& operator*=(const audio_transform& other);
     audio_transform  operator*(const audio_transform& other) const;

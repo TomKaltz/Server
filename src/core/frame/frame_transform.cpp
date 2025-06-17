@@ -156,6 +156,9 @@ bool operator!=(const image_transform& lhs, const image_transform& rhs) { return
 audio_transform& audio_transform::operator*=(const audio_transform& other)
 {
     volume *= other.volume;
+    if (!other.audio_channel_map.empty()) {
+        audio_channel_map = other.audio_channel_map;
+    }
     return *this;
 }
 
@@ -172,11 +175,16 @@ audio_transform audio_transform::tween(double                 time,
 {
     audio_transform result;
     result.volume = do_tween(time, source.volume, dest.volume, duration, tween);
+    
+    result.audio_channel_map = dest.audio_channel_map;
 
     return result;
 }
 
-bool operator==(const audio_transform& lhs, const audio_transform& rhs) { return eq(lhs.volume, rhs.volume); }
+bool operator==(const audio_transform& lhs, const audio_transform& rhs) 
+{ 
+    return eq(lhs.volume, rhs.volume) && lhs.audio_channel_map == rhs.audio_channel_map; 
+}
 
 bool operator!=(const audio_transform& lhs, const audio_transform& rhs) { return !(lhs == rhs); }
 

@@ -1337,6 +1337,78 @@ std::future<std::wstring> mixer_volume_command(command_context& ctx)
         [](frame_transform& t, double value) { t.audio_transform.volume = value; });
 }
 
+std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
+{
+    if (ctx.parameters.empty()) {
+        // Return current audio remap configuration
+        auto transform2 = get_current_transform(ctx).share();
+        return std::async(std::launch::deferred, [transform2]() -> std::wstring {
+            auto transform = transform2.get().audio_transform;
+            std::wstring result = L"201 MIXER OK\r\n";
+            if (!transform.audio_channel_map.empty()) {
+                for (size_t i = 0; i < transform.audio_channel_map.size(); ++i) {
+                    if (i > 0) result += L",";
+                    result += std::to_wstring(transform.audio_channel_map[i]);
+                }
+            }
+            result += L"\r\n";
+            return result;
+        });
+    }
+
+    // Check if we want to clear the remap
+    if (ctx.parameters.at(0).empty() || boost::iequals(ctx.parameters.at(0), L"CLEAR")) {
+        transforms_applier transforms(ctx);
+        
+        transforms.add(stage::transform_tuple_t(
+            ctx.layer_index(),
+            [=](frame_transform transform) -> frame_transform {
+                transform.audio_transform.audio_channel_map.clear();
+                return transform;
+            },
+            0,
+            L"linear"));
+        transforms.apply();
+
+        return make_ready_future<std::wstring>(L"202 MIXER OK\r\n");
+    }
+
+    transforms_applier transforms(ctx);
+    
+    // Parse the comma-separated channel mapping
+    std::vector<int> channel_map;
+    std::wstringstream ss(ctx.parameters.at(0));
+    std::wstring item;
+    while (std::getline(ss, item, L',')) {
+        try {
+            int channel = std::stoi(item);
+            if (channel < 0 || channel > 16) {
+                CASPAR_LOG(warning) << "Invalid audio remap channel: " << channel << ", must be 0-16";
+                channel = 0; // Default to silence for invalid values
+            }
+            channel_map.push_back(channel);
+        } catch (const std::exception&) {
+            CASPAR_LOG(warning) << "Invalid audio remap value: " << u8(item);
+            channel_map.push_back(0); // Default to silence
+        }
+    }
+
+    int duration = ctx.parameters.size() > 1 ? std::stoi(ctx.parameters[1]) : 0;
+    std::wstring tween = ctx.parameters.size() > 2 ? ctx.parameters[2] : L"linear";
+
+    transforms.add(stage::transform_tuple_t(
+        ctx.layer_index(),
+        [=](frame_transform transform) -> frame_transform {
+            transform.audio_transform.audio_channel_map = channel_map;
+            return transform;
+        },
+        duration,
+        tween));
+    transforms.apply();
+
+    return make_ready_future<std::wstring>(L"202 MIXER OK\r\n");
+}
+
 std::wstring mixer_mastervolume_command(command_context& ctx)
 {
     if (ctx.parameters.empty()) {
@@ -1788,6 +1860,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"Mixer Commands", L"MIXER ROTATION", mixer_rotation_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER PERSPECTIVE", mixer_perspective_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER VOLUME", mixer_volume_command, 0);
+    repo->register_channel_command(L"Mixer Commands", L"MIXER AUDIOREMAP", mixer_audio_remap_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER MASTERVOLUME", mixer_mastervolume_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER GRID", mixer_grid_command, 1);
     repo->register_channel_command(L"Mixer Commands", L"MIXER COMMIT", mixer_commit_command, 0);
