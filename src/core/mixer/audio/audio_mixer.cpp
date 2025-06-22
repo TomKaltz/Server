@@ -212,6 +212,16 @@ struct audio_mixer::impl
                 }
             }
 
+            // Get previous volume for this tag, defaulting to current volume
+            double previous_volume = item.transform.volume;
+            auto prev_vol_it = previous_volumes_.find(item.tag);
+            if (prev_vol_it != previous_volumes_.end()) {
+                previous_volume = prev_vol_it->second;
+            }
+            
+            // Store current volume for next frame
+            next_volumes[item.tag] = item.transform.volume;
+
             // Sample collection and volume application loop
             for (auto n = 0; n < dst_size; ++n) {
                 double sample_value = 0.0;
@@ -232,28 +242,18 @@ struct audio_mixer::impl
                 
                 double applied_volume = item.transform.volume;
                 
-                // Get previous volume for this audio stream
-                double previous_volume = item.transform.volume; // Default to current volume
-                if (item.tag) {
-                    auto prev_vol_it = previous_volumes_.find(item.tag);
-                    if (prev_vol_it != previous_volumes_.end()) {
-                        previous_volume = prev_vol_it->second;
-                    }
-                }
-                
+                // Apply sample-level volume ramping if not immediate volume and there's a volume change
                 if (!item.transform.immediate_volume && std::abs(item.transform.volume - previous_volume) > 0.001) {
                     size_t sample_index = n / channels_;
-                    // Simple linear ramping between previous and current volume
-                    double position = static_cast<double>(sample_index) / static_cast<double>(dst_size / channels_);
+                    size_t total_samples = dst_size / channels_;
+                    
+                    // Calculate linear interpolation position (0.0 to 1.0)
+                    double position = total_samples > 1 ? 
+                        static_cast<double>(sample_index) / static_cast<double>(total_samples - 1) : 1.0;
                     position = std::min(1.0, std::max(0.0, position)); // Clamp between 0 and 1
 
+                    // Linear interpolation between previous and current volume
                     applied_volume = previous_volume + (item.transform.volume - previous_volume) * position;
-
-                    // Clamp to avoid overshoot beyond the intended target
-                    double low  = std::min(item.transform.volume, previous_volume);
-                    double high = std::max(item.transform.volume, previous_volume);
-                    if (applied_volume < low)  applied_volume = low;
-                    if (applied_volume > high) applied_volume = high;
                 }
                 
                 mixed[n] += sample_value * applied_volume;
@@ -284,11 +284,6 @@ struct audio_mixer::impl
                 } else {
                     next_audio_streams[item.tag] = std::vector<int32_t>();
                 }
-            }
-
-            // Store current volume for next frame
-            if (item.tag) {
-                next_volumes[item.tag] = item.transform.volume;
             }
         }
         
