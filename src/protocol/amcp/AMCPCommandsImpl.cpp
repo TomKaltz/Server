@@ -1373,26 +1373,26 @@ std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
         return make_ready_future<std::wstring>(L"202 MIXER OK\r\n");
     }
 
-    transforms_applier transforms(ctx);
-    
     // Parse the comma-separated channel mapping
     std::vector<int> channel_map;
     std::wstringstream ss(ctx.parameters.at(0));
     std::wstring item;
+    
     while (std::getline(ss, item, L',')) {
         try {
             int channel = std::stoi(item);
             if (channel < 0 || channel > 16) {
                 CASPAR_LOG(warning) << "Invalid audio remap channel: " << channel << ", must be 0-16";
-                channel = 0; // Default to silence for invalid values
+                return make_ready_future<std::wstring>(L"400 MIXER AUDIOREMAP FAILED\r\n");
             }
             channel_map.push_back(channel);
         } catch (const std::exception&) {
             CASPAR_LOG(warning) << "Invalid audio remap value: " << u8(item);
-            channel_map.push_back(0); // Default to silence
+            return make_ready_future<std::wstring>(L"400 MIXER AUDIOREMAP FAILED\r\n");
         }
     }
 
+    transforms_applier transforms(ctx);
     int duration = ctx.parameters.size() > 1 ? std::stoi(ctx.parameters[1]) : 0;
     std::wstring tween = ctx.parameters.size() > 2 ? ctx.parameters[2] : L"linear";
 
@@ -1892,3 +1892,4 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_command(L"Query Commands", L"OSC UNSUBSCRIBE", osc_unsubscribe_command, 1);
 }
 }}} // namespace caspar::protocol::amcp
+
