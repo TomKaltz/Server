@@ -143,7 +143,7 @@ struct server::impl
         CASPAR_LOG(info) << L"Initialized modules.";
 
         setup_channel_producers_and_consumers(xml_channels);
-        CASPAR_LOG(info) << L"Initialized startup producers.";
+        CASPAR_LOG(info) << L"Initialized startup consumer, producers and mixer transforms.";
 
         setup_controllers(env::properties());
         CASPAR_LOG(info) << L"Initialized controllers.";
@@ -396,6 +396,48 @@ struct server::impl
                         }
                     } catch (const user_error&) {
                         CASPAR_LOG(error) << "Failed to parse command: " << command;
+                    } catch (...) {
+                        CASPAR_LOG_CURRENT_EXCEPTION();
+                    }
+                }
+            }
+
+            // Mixer transforms
+            if (xml_channel.get_child_optional(L"mixer-transforms")) {
+                for (auto& xml_transform :
+                     xml_channel | witerate_children(L"mixer-transforms") | welement_context_iteration) {
+                    ptree_verify_element_name(xml_transform, L"transform");
+
+                    const std::wstring command_suffix = xml_transform.second.get_value(L"");
+                    const auto         attrs          = xml_transform.second.get_child_optional(L"<xmlattr>");
+                    const int          layer_id       = attrs ? attrs->get(L"id", -1) : -1;
+
+                    try {
+                        std::wstring full_command;
+
+                        // Construct the full MIXER command
+                        if (layer_id != -1) {
+                            // Layer-specific mixer command
+                            full_command = L"MIXER " +
+                                           (boost::wformat(L"%i-%i") % channel.raw_channel->index() % layer_id).str() +
+                                           L" " + command_suffix;
+                        } else {
+                            // Channel-level mixer command
+                            full_command =
+                                L"MIXER " + std::to_wstring(channel.raw_channel->index()) + L" " + command_suffix;
+                        }
+
+                        std::list<std::wstring> tokens;
+                        IO::tokenize(full_command, tokens);
+                        auto cmd = amcp_command_repo_->parse_command(console_client, tokens, L"");
+
+                        if (cmd) {
+                            std::wstring res = cmd->Execute(channels_).get();
+                            console_client->send(std::move(res), false);
+                            CASPAR_LOG(info) << L"Applied mixer transform: " << full_command;
+                        }
+                    } catch (const user_error&) {
+                        CASPAR_LOG(error) << "Failed to parse mixer transform command: " << command_suffix;
                     } catch (...) {
                         CASPAR_LOG_CURRENT_EXCEPTION();
                     }
