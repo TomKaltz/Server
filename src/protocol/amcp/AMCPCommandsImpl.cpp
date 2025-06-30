@@ -322,6 +322,16 @@ std::wstring loadbg_command(command_context& ctx)
         // TODO - we should pass the format into load(), so that we can catch it having changed since the producer was
         // initialised
         ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play); // TODO: LOOP
+        std::optional<uint32_t> auto_length_param;
+        if (contains_param(L"AUTO_LENGTH", ctx.parameters)) {
+            auto_length_param = get_param(L"AUTO_LENGTH", ctx.parameters, static_cast<uint32_t>(0));
+        }
+
+        if (auto_length_param) {
+            ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play, auto_length_param);
+        } else {
+            ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play);
+        }
     } catch (file_not_found&) {
         if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
             ctx.channel.stage->load(
@@ -344,16 +354,16 @@ std::wstring load_command(command_context& ctx)
         ctx.channel.stage->preview(ctx.layer_index());
     } else {
         auto uid = get_param(L"UID", ctx.parameters, L"");
-        
+
         try {
             auto new_producer = ctx.static_context->producer_registry->create_producer(
                 get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
-            
+
             // Set UID on the producer if provided
             if (!uid.empty()) {
                 new_producer->set_uid(uid);
             }
-            
+
             auto transition_producer = create_transition_producer(new_producer, transition_info{});
 
             // Copy UID from the original producer to the transition producer
@@ -362,6 +372,16 @@ std::wstring load_command(command_context& ctx)
             }
 
             ctx.channel.stage->load(ctx.layer_index(), transition_producer, true);
+            std::optional<uint32_t> auto_length_param;
+            if (contains_param(L"AUTO_LENGTH", ctx.parameters)) {
+                auto_length_param = get_param(L"AUTO_LENGTH", ctx.parameters, static_cast<uint32_t>(0));
+            }
+
+            if (auto_length_param) {
+                ctx.channel.stage->load(ctx.layer_index(), transition_producer, true, false, auto_length_param);
+            } else {
+                ctx.channel.stage->load(ctx.layer_index(), transition_producer, true);
+            }
         } catch (file_not_found&) {
             if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
                 ctx.channel.stage->load(
@@ -1366,11 +1386,12 @@ std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
         // Return current audio remap configuration
         auto transform2 = get_current_transform(ctx).share();
         return std::async(std::launch::deferred, [transform2]() -> std::wstring {
-            auto transform = transform2.get().audio_transform;
-            std::wstring result = L"201 MIXER OK\r\n";
+            auto         transform = transform2.get().audio_transform;
+            std::wstring result    = L"201 MIXER OK\r\n";
             if (!transform.audio_channel_map.empty()) {
                 for (size_t i = 0; i < transform.audio_channel_map.size(); ++i) {
-                    if (i > 0) result += L",";
+                    if (i > 0)
+                        result += L",";
                     result += std::to_wstring(transform.audio_channel_map[i]);
                 }
             }
@@ -1382,7 +1403,7 @@ std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
     // Check if we want to clear the remap
     if (ctx.parameters.at(0).empty() || boost::iequals(ctx.parameters.at(0), L"CLEAR")) {
         transforms_applier transforms(ctx);
-        
+
         transforms.add(stage::transform_tuple_t(
             ctx.layer_index(),
             [=](frame_transform transform) -> frame_transform {
@@ -1397,10 +1418,10 @@ std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
     }
 
     // Parse the comma-separated channel mapping
-    std::vector<int> channel_map;
+    std::vector<int>   channel_map;
     std::wstringstream ss(ctx.parameters.at(0));
-    std::wstring item;
-    
+    std::wstring       item;
+
     while (std::getline(ss, item, L',')) {
         try {
             int channel = std::stoi(item);
@@ -1416,8 +1437,8 @@ std::future<std::wstring> mixer_audio_remap_command(command_context& ctx)
     }
 
     transforms_applier transforms(ctx);
-    int duration = ctx.parameters.size() > 1 ? std::stoi(ctx.parameters[1]) : 0;
-    std::wstring tween = ctx.parameters.size() > 2 ? ctx.parameters[2] : L"linear";
+    int                duration = ctx.parameters.size() > 1 ? std::stoi(ctx.parameters[1]) : 0;
+    std::wstring       tween    = ctx.parameters.size() > 2 ? ctx.parameters[2] : L"linear";
 
     transforms.add(stage::transform_tuple_t(
         ctx.layer_index(),
@@ -1916,4 +1937,3 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_command(L"Query Commands", L"OSC UNSUBSCRIBE", osc_unsubscribe_command, 1);
 }
 }}} // namespace caspar::protocol::amcp
-
