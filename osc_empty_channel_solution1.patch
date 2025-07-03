@@ -1,0 +1,43 @@
+--- a/src/core/producer/stage.cpp
++++ b/src/core/producer/stage.cpp
+@@ -320,7 +320,19 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+ 
+     std::future<void> clear(int index)
+     {
+-        return executor_.begin_invoke([=] { layers_.erase(index); });
++        return executor_.begin_invoke([=] {
++            auto it = layers_.find(index);
++            if (it != layers_.end()) {
++                // Stop the layer to set foreground to empty
++                it->second.stop();
++                
++                // Force immediate state update to show as empty
++                monitor::state final_state;
++                final_state["layer"][index] = it->second.state();
++                state_ = std::move(final_state);
++            }
++            layers_.erase(index);
++        });
+     }
+ 
+     std::future<void> clear()
+@@ -346,6 +358,18 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+     std::future<void> clear()
+     {
+-        return executor_.begin_invoke([=] { layers_.clear(); });
++        return executor_.begin_invoke([=] {
++            // Send final empty state for all layers before clearing
++            monitor::state final_state;
++            for (auto& p : layers_) {
++                p.second.stop(); // Set each layer to empty
++                final_state["layer"][p.first] = p.second.state();
++            }
++            if (!layers_.empty()) {
++                state_ = std::move(final_state);
++            }
++            
++            layers_.clear();
++        });
+     }
+ 
+     std::future<void> swap_layers(const std::shared_ptr<stage>& other, bool swap_transforms)
