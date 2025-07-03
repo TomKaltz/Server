@@ -50,6 +50,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     monitor::state                      state_;
     std::map<int, layer>                layers_;
     std::map<int, tweened_transform>    tweens_;
+    std::set<int>                       recently_cleared_layers_;
     std::set<int>                       routeSources;
 
     mutable std::mutex      format_desc_mutex_;
@@ -220,6 +221,17 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 for (auto& p : layers_) {
                     state["layer"][p.first] = p.second.state();
                 }
+                
+                // Include recently cleared layers in state
+                for (int layer_index : recently_cleared_layers_) {
+                    state["layer"][layer_index]["foreground"]["producer"] = "cleared";
+                    state["layer"][layer_index]["background"]["producer"] = "cleared";
+                    state["layer"][layer_index]["status"] = "cleared";
+                }
+                
+                // Clear the recently cleared set after one frame
+                recently_cleared_layers_.clear();
+                
                 state_ = std::move(state);
             } catch (...) {
                 layers_.clear();
@@ -313,12 +325,23 @@ struct stage::impl : public std::enable_shared_from_this<impl>
 
     std::future<void> clear(int index)
     {
-        return executor_.begin_invoke([=] { layers_.erase(index); });
+        return executor_.begin_invoke([=] {
+            if (layers_.find(index) != layers_.end()) {
+                recently_cleared_layers_.insert(index);
+            }
+            layers_.erase(index);
+        });
     }
 
     std::future<void> clear()
     {
-        return executor_.begin_invoke([=] { layers_.clear(); });
+        return executor_.begin_invoke([=] {
+            for (auto& p : layers_) {
+                recently_cleared_layers_.insert(p.first);
+            }
+            
+            layers_.clear();
+        });
     }
 
     std::future<void> swap_layers(const std::shared_ptr<stage>& other, bool swap_transforms)
@@ -420,6 +443,11 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             {
                 std::lock_guard<std::mutex> lock(format_desc_mutex_);
                 format_desc_ = format_desc;
+            }
+
+            // Mark all layers as cleared when format changes
+            for (auto& p : layers_) {
+                recently_cleared_layers_.insert(p.first);
             }
 
             layers_.clear();
