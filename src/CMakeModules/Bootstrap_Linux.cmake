@@ -40,8 +40,27 @@ find_package(SFML 2 COMPONENTS graphics window REQUIRED)
 find_package(X11 REQUIRED)
 
 # nlohmann/json - try system package first, fall back to fetching
-find_package(nlohmann_json 3.12.0 QUIET)
+find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
+    # Try to find the header file directly
+    find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+        PATHS /usr/include /usr/local/include
+        PATH_SUFFIXES nlohmann
+    )
+    if(NLOHMANN_JSON_INCLUDE_DIR)
+        set(nlohmann_json_FOUND TRUE)
+        add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
+        target_include_directories(nlohmann_json::nlohmann_json INTERFACE ${NLOHMANN_JSON_INCLUDE_DIR}/..)
+    endif()
+endif()
+
+if(NOT nlohmann_json_FOUND)
+    # Check if we're in a fully disconnected environment (like Debian build)
+    if(FETCHCONTENT_FULLY_DISCONNECTED)
+        message(FATAL_ERROR "nlohmann/json not found and FETCHCONTENT_FULLY_DISCONNECTED is enabled. Please ensure nlohmann-json3-dev is installed.")
+    endif()
+    
+    # Use FetchContent to download and configure nlohmann/json
     FetchContent_Declare(nlohmann_json
         URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
         DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
