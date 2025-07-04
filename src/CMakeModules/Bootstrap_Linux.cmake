@@ -38,8 +38,6 @@ find_package(TBB REQUIRED)
 find_package(OpenAL REQUIRED)
 find_package(SFML 2 COMPONENTS graphics window REQUIRED)
 find_package(X11 REQUIRED)
-
-# nlohmann/json
 find_package(nlohmann_json REQUIRED)
 
 # support for Ubuntu 22.04
