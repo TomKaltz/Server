@@ -38,16 +38,8 @@ find_package(TBB REQUIRED)
 find_package(OpenAL REQUIRED)
 find_package(SFML 2 COMPONENTS graphics window REQUIRED)
 find_package(X11 REQUIRED)
-# Try to find nlohmann/json - with fallback to FetchContent
-find_package(nlohmann_json 3.12.0 QUIET)
-if(NOT nlohmann_json_FOUND)
-    # Fallback to FetchContent using the recommended URL approach
-    FetchContent_Declare(nlohmann_json
-        URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
-        DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
-    )
-    FetchContent_MakeAvailable(nlohmann_json)
-endif()
+# nlohmann-json must be provided by the distribution package (nlohmann-json3-dev)
+find_package(nlohmann_json 3.10.0 REQUIRED)
 
 # support for Ubuntu 22.04
 if (NOT TARGET OpenAL::OpenAL)
