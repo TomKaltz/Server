@@ -30,6 +30,7 @@
 
 #include <common/array.h>
 #include <common/bit_depth.h>
+#include <common/env.h>
 #include <common/future.h>
 #include <common/log.h>
 
@@ -87,7 +88,9 @@ class image_renderer
     std::future<array<const std::uint8_t>> operator()(std::vector<layer>             layers,
                                                       const core::video_format_desc& format_desc)
     {
-        if (layers.empty()) { // Bypass GPU with empty frame.
+        // Bypass GPU rendering if configured or if layers are empty
+        bool bypass_gpu = env::properties().get(L"configuration.accelerator.bypass-gpu", false);
+        if (bypass_gpu || layers.empty()) {
             static const std::vector<uint8_t, boost::alignment::aligned_allocator<uint8_t, 32>> buffer(max_frame_size_, 0);
             return make_ready_future(array<const std::uint8_t>(buffer.data(), format_desc.size, true));
         }
@@ -256,7 +259,12 @@ struct image_mixer::impl
         , renderer_(ogl, max_frame_size, depth)
         , transform_stack_(1)
     {
-        CASPAR_LOG(info) << L"Initialized OpenGL Accelerated GPU Image Mixer for channel " << channel_id;
+        bool bypass_gpu = env::properties().get(L"configuration.accelerator.bypass-gpu", false);
+        if (bypass_gpu) {
+            CASPAR_LOG(info) << L"Initialized CPU-Only Image Mixer (GPU bypassed) for channel " << channel_id;
+        } else {
+            CASPAR_LOG(info) << L"Initialized OpenGL Accelerated GPU Image Mixer for channel " << channel_id;
+        }
     }
 
     void update_aspect_ratio(double aspect_ratio) { aspect_ratio_ = aspect_ratio; }
