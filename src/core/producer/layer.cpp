@@ -41,6 +41,12 @@ struct layer::impl
     bool auto_play_ = false;
     bool paused_    = false;
 
+    // AUTO_COMMIT functionality
+    std::function<void()> auto_commit_command_;
+    int auto_commit_frame_delay_ = 0;
+    int auto_commit_frames_remaining_ = 0;
+    bool auto_commit_triggered_ = false;
+
   public:
     impl(const core::video_format_desc format_desc)
         : format_desc_(format_desc)
@@ -101,6 +107,23 @@ struct layer::impl
     {
         foreground_ = frame_producer::empty();
         auto_play_  = false;
+        clear_auto_commit_command();
+    }
+
+    void set_auto_commit_command(std::function<void()> command, int frame_delay)
+    {
+        auto_commit_command_ = std::move(command);
+        auto_commit_frame_delay_ = frame_delay;
+        auto_commit_frames_remaining_ = frame_delay;
+        auto_commit_triggered_ = false;
+    }
+
+    void clear_auto_commit_command()
+    {
+        auto_commit_command_ = nullptr;
+        auto_commit_frame_delay_ = 0;
+        auto_commit_frames_remaining_ = 0;
+        auto_commit_triggered_ = false;
     }
 
     draw_frame receive(const video_field field, int nb_samples)
@@ -119,7 +142,29 @@ struct layer::impl
                     frames_left   = duration - time - *auto_play_delta;
                     if (frames_left < 1 && field != video_field::b) {
                         play();
+                        
+                        // Trigger AUTO_COMMIT when auto-play occurs
+                        if (auto_commit_command_ && !auto_commit_triggered_) {
+                            auto_commit_triggered_ = true;
+                            if (auto_commit_frame_delay_ == 0) {
+                                // Execute immediately
+                                auto_commit_command_();
+                                clear_auto_commit_command();
+                            } else {
+                                // Set up delayed execution
+                                auto_commit_frames_remaining_ = auto_commit_frame_delay_;
+                            }
+                        }
                     }
+                }
+            }
+
+            // Handle delayed AUTO_COMMIT execution
+            if (auto_commit_triggered_ && auto_commit_frames_remaining_ > 0 && field != video_field::b) {
+                auto_commit_frames_remaining_--;
+                if (auto_commit_frames_remaining_ <= 0) {
+                    auto_commit_command_();
+                    clear_auto_commit_command();
                 }
             }
 
@@ -193,4 +238,15 @@ spl::shared_ptr<frame_producer> layer::foreground() const { return impl_->foregr
 spl::shared_ptr<frame_producer> layer::background() const { return impl_->background_; }
 bool                            layer::has_background() const { return impl_->background_ != frame_producer::empty(); }
 core::monitor::state            layer::state() const { return impl_->state_; }
+
+// AUTO_COMMIT functionality
+void layer::set_auto_commit_command(std::function<void()> command, int frame_delay)
+{
+    impl_->set_auto_commit_command(std::move(command), frame_delay);
+}
+
+void layer::clear_auto_commit_command()
+{
+    impl_->clear_auto_commit_command();
+}
 }} // namespace caspar::core

@@ -27,6 +27,8 @@
 #include "../monitor/monitor.h"
 
 #include <common/memory.h>
+#include <future>
+#include <functional>
 
 namespace caspar { namespace core {
 
@@ -58,6 +60,10 @@ class layer final
     spl::shared_ptr<frame_producer> foreground() const;
     spl::shared_ptr<frame_producer> background() const;
     bool                            has_background() const;
+
+    // AUTO_COMMIT functionality
+    void set_auto_commit_command(std::function<void()> command, int frame_delay = 0);
+    void clear_auto_commit_command();
 
   private:
     struct impl;

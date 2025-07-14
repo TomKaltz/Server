@@ -98,6 +98,10 @@ class stage_base
 
     virtual std::future<void> execute(std::function<void()> k) = 0;
 
+    // AUTO_COMMIT functionality
+    virtual std::future<void> set_auto_commit_command(int index, std::function<void()> command, int frame_delay = 0) = 0;
+    virtual std::future<void> clear_auto_commit_command(int index) = 0;
+
     // Properties
     virtual std::future<std::shared_ptr<frame_producer>> foreground(int index) = 0;
     virtual std::future<std::shared_ptr<frame_producer>> background(int index) = 0;
@@ -154,6 +158,10 @@ class stage final : public stage_base
     std::future<void>            execute(std::function<void()> k) override;
     std::unique_lock<std::mutex> get_lock() const;
 
+    // AUTO_COMMIT functionality
+    std::future<void> set_auto_commit_command(int index, std::function<void()> command, int frame_delay = 0) override;
+    std::future<void> clear_auto_commit_command(int index) override;
+
     core::video_format_desc video_format_desc() const;
     std::future<void>       video_format_desc(const core::video_format_desc& format_desc);
 
@@ -209,6 +217,10 @@ class stage_delayed final : public stage_base
 
     std::future<void>            execute(std::function<void()> k) override;
     std::unique_lock<std::mutex> get_lock() const { return stage_->get_lock(); }
+
+    // AUTO_COMMIT functionality
+    std::future<void> set_auto_commit_command(int index, std::function<void()> command, int frame_delay = 0) override;
+    std::future<void> clear_auto_commit_command(int index) override;
 
   private:
     std::promise<void>      waiter_;

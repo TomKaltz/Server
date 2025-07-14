@@ -275,13 +275,33 @@ bool try_match_sting(const std::vector<std::wstring>& params, sting_info& stingI
 
 std::wstring loadbg_command(command_context& ctx)
 {
-    // Perform loading of the clip
     core::diagnostics::scoped_call_context save;
     core::diagnostics::call_context::for_thread().video_channel = ctx.channel_index + 1;
     core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
 
     auto channel   = ctx.channel.raw_channel;
     bool auto_play = contains_param(L"AUTO", ctx.parameters);
+    
+    // Check for AUTO_COMMIT parameter
+    bool auto_commit = false;
+    int auto_commit_frame_delay = 0;
+    
+    for (size_t i = 0; i < ctx.parameters.size(); ++i) {
+        if (boost::iequals(ctx.parameters[i], L"AUTO_COMMIT")) {
+            auto_commit = true;
+            // Check if next parameter is a number (frame delay)
+            if (i + 1 < ctx.parameters.size()) {
+                try {
+                    auto_commit_frame_delay = std::stoi(ctx.parameters[i + 1]);
+                    // Remove the frame delay parameter from the list
+                    ctx.parameters.erase(ctx.parameters.begin() + i + 1);
+                } catch (const std::exception&) {
+                    // Not a number, ignore
+                }
+            }
+            break;
+        }
+    }
 
     try {
         auto new_producer = ctx.static_context->producer_registry->create_producer(
@@ -311,6 +331,28 @@ std::wstring loadbg_command(command_context& ctx)
         // TODO - we should pass the format into load(), so that we can catch it having changed since the producer was
         // initialised
         ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play); // TODO: LOOP
+        
+        // Set up AUTO_COMMIT if requested
+        if (auto_commit) {
+            // Create a function that will send a COMMIT command when auto-play occurs
+            // This is the simplest approach - just send "COMMIT" back to the client
+            auto client_ref = ctx.client;
+            
+            auto commit_function = [client_ref]() {
+                try {
+                    if (client_ref) {
+                        // Send a COMMIT command back to the client
+                        // This will trigger the same batch processing as if they typed COMMIT
+                        client_ref->send(L"COMMIT\r\n");
+                        CASPAR_LOG(info) << "AUTO_COMMIT sent COMMIT command to client " << client_ref->address();
+                    }
+                } catch (...) {
+                    CASPAR_LOG_CURRENT_EXCEPTION();
+                }
+            };
+            
+            ctx.channel.stage->set_auto_commit_command(ctx.layer_index(), commit_function, auto_commit_frame_delay);
+        }
     } catch (file_not_found&) {
         if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
             ctx.channel.stage->load(

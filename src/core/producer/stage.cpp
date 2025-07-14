@@ -425,6 +425,17 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             layers_.clear();
         });
     }
+
+    // AUTO_COMMIT functionality
+    std::future<void> set_auto_commit_command(int index, std::function<void()> command, int frame_delay)
+    {
+        return executor_.begin_invoke([=] { get_layer(index).set_auto_commit_command(std::move(command), frame_delay); });
+    }
+
+    std::future<void> clear_auto_commit_command(int index)
+    {
+        return executor_.begin_invoke([=] { get_layer(index).clear_auto_commit_command(); });
+    }
 };
 
 stage::stage(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc)
@@ -482,8 +493,8 @@ stage::swap_layer(int index, int other_index, const std::shared_ptr<stage_base>&
 std::future<std::shared_ptr<frame_producer>> stage::foreground(int index) { return impl_->foreground(index); }
 std::future<std::shared_ptr<frame_producer>> stage::background(int index) { return impl_->background(index); }
 const stage_frames                           stage::operator()(uint64_t                                     frame_number,
-                                     std::vector<int>&                            fetch_background,
-                                     std::function<void(int, const layer_frame&)> routesCb)
+                                                              std::vector<int>&                            fetch_background,
+                                                              std::function<void(int, const layer_frame&)> routesCb)
 {
     return (*impl_)(frame_number, fetch_background, routesCb);
 }
@@ -496,8 +507,18 @@ std::future<void>       stage::video_format_desc(const core::video_format_desc& 
 std::unique_lock<std::mutex> stage::get_lock() const { return impl_->get_lock(); }
 std::future<void>            stage::execute(std::function<void()> func)
 {
-    func();
-    return make_ready_future();
+    return impl_->executor_.begin_invoke(std::move(func));
+}
+
+// AUTO_COMMIT functionality
+std::future<void> stage::set_auto_commit_command(int index, std::function<void()> command, int frame_delay)
+{
+    return impl_->set_auto_commit_command(index, std::move(command), frame_delay);
+}
+
+std::future<void> stage::clear_auto_commit_command(int index)
+{
+    return impl_->clear_auto_commit_command(index);
 }
 
 // STAGE DELAYED (For batching operations)
@@ -602,12 +623,22 @@ std::future<std::shared_ptr<frame_producer>> stage_delayed::foreground(int index
 }
 std::future<std::shared_ptr<frame_producer>> stage_delayed::background(int index)
 {
-    return executor_.begin_invoke([=]() -> std::shared_ptr<frame_producer> { return stage_->background(index).get(); });
+    return stage_->background(index);
 }
-
 std::future<void> stage_delayed::execute(std::function<void()> func)
 {
-    return executor_.begin_invoke([=]() { return stage_->execute(func).get(); });
+    return executor_.begin_invoke(std::move(func));
+}
+
+// AUTO_COMMIT functionality
+std::future<void> stage_delayed::set_auto_commit_command(int index, std::function<void()> command, int frame_delay)
+{
+    return executor_.begin_invoke([=] { stage_->set_auto_commit_command(index, std::move(command), frame_delay); });
+}
+
+std::future<void> stage_delayed::clear_auto_commit_command(int index)
+{
+    return executor_.begin_invoke([=] { stage_->clear_auto_commit_command(index); });
 }
 
 }} // namespace caspar::core
