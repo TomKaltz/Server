@@ -65,40 +65,36 @@ namespace caspar { namespace protocol { namespace websocket {
 // WebSocket monitor session implementation
 class websocket_monitor_session : public std::enable_shared_from_this<websocket_monitor_session>
 {
-    ws::stream<beast::tcp_stream>                                   ws_;
-    beast::flat_buffer                                              buffer_;
-    std::shared_ptr<websocket_monitor_client>                       monitor_client_;
-    std::string                                                     connection_id_;
-    std::string                                                     client_address_;
-    std::atomic<bool>                                               is_open_{false};
-    std::unique_ptr<boost::asio::deadline_timer>                    force_close_timer_;
-    boost::asio::io_context&                                        io_context_;
-    std::function<void(std::shared_ptr<websocket_monitor_session>)> session_removal_callback_;
-    bool                                                            write_in_flight_{false};
-    std::atomic<bool>                                               removal_callback_called_{false};
+    ws::stream<beast::tcp_stream>                ws_;
+    beast::flat_buffer                           buffer_;
+    std::shared_ptr<websocket_monitor_client>    monitor_client_;
+    std::string                                  connection_id_;
+    std::string                                  client_address_;
+    std::atomic<bool>                            is_open_{false};
+    std::unique_ptr<boost::asio::deadline_timer> force_close_timer_;
+    boost::asio::io_context&                     io_context_;
+    bool                                         write_in_flight_{false};
 
-    // Circuit breaker configuration
-    static constexpr int SUSTAINED_FAILURE_SECONDS = 20; // Close connection after 20 seconds of failures
+    // Simple timeout for sustained message dropping
+    static constexpr int SUSTAINED_DROP_SECONDS = 30; // Close connection after 30 seconds of continuous drops
 
     // Statistics tracking
     std::atomic<int>                      total_messages_sent_{0};
     std::atomic<int>                      total_messages_dropped_{0};
     std::chrono::steady_clock::time_point first_failure_time_;
     std::chrono::steady_clock::time_point last_drop_time_;
+    std::chrono::steady_clock::time_point first_drop_time_;
     bool                                  has_failures_{false};
     bool                                  has_drops_{false};
 
   public:
-    explicit websocket_monitor_session(
-        boost::asio::io_context&                                        io_context,
-        tcp::socket&&                                                   socket,
-        std::shared_ptr<websocket_monitor_client>                       monitor_client,
-        std::function<void(std::shared_ptr<websocket_monitor_session>)> session_removal_callback = nullptr)
+    explicit websocket_monitor_session(boost::asio::io_context&                  io_context,
+                                       tcp::socket&&                             socket,
+                                       std::shared_ptr<websocket_monitor_client> monitor_client)
         : ws_(std::move(socket))
         , monitor_client_(std::move(monitor_client))
         , connection_id_(generate_connection_id())
         , io_context_(io_context)
-        , session_removal_callback_(std::move(session_removal_callback))
     {
         // Get client address from socket
         try {
@@ -124,32 +120,8 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             }
         }
 
-        // Remove from monitor client if still connected
-        if (monitor_client_) {
-            try {
-                monitor_client_->remove_connection(connection_id_);
-            } catch (const std::exception& e) {
-                CASPAR_LOG(error) << L"WebSocket monitor session destructor cleanup error: " << u16(e.what());
-            }
-        }
-
-        // Notify listener that this session is being destroyed (only once)
-        if (session_removal_callback_ && !removal_callback_called_.exchange(true)) {
-            try {
-                // Post to IO context to avoid calling callback during destruction
-                boost::asio::post(io_context_, [this]() {
-                    try {
-                        if (session_removal_callback_) {
-                            session_removal_callback_(shared_from_this());
-                        }
-                    } catch (const std::exception& e) {
-                        CASPAR_LOG(error) << L"WebSocket monitor session removal callback error: " << u16(e.what());
-                    }
-                });
-            } catch (const std::exception& e) {
-                CASPAR_LOG(error) << L"WebSocket monitor session removal callback error: " << u16(e.what());
-            }
-        }
+        // Simple cleanup - just remove from monitor client
+        cleanup_connection();
     }
 
     void run()
@@ -201,14 +173,29 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
 
                     // Log first drop
                     if (!self->has_drops_) {
-                        self->has_drops_      = true;
-                        self->last_drop_time_ = std::chrono::steady_clock::now();
+                        self->has_drops_       = true;
+                        self->first_drop_time_ = std::chrono::steady_clock::now();
+                        self->last_drop_time_  = std::chrono::steady_clock::now();
                         CASPAR_LOG(warning)
                             << L"WebSocket monitor: client " << u16(self->connection_id_) << L" ("
                             << u16(self->client_address_) << L") dropped first message - client may be slow";
                     } else {
                         // Update last drop time on subsequent drops
                         self->last_drop_time_ = std::chrono::steady_clock::now();
+                    }
+
+                    // Check if we've been dropping messages for too long
+                    auto now = std::chrono::steady_clock::now();
+                    auto drop_duration =
+                        std::chrono::duration_cast<std::chrono::seconds>(now - self->first_drop_time_).count();
+
+                    if (drop_duration >= SUSTAINED_DROP_SECONDS) {
+                        CASPAR_LOG(warning) << L"WebSocket monitor: client " << u16(self->connection_id_) << L" ("
+                                            << u16(self->client_address_) << L") has been dropping messages for "
+                                            << drop_duration << L" seconds. Closing connection.";
+                        self->is_open_ = false;
+                        self->cleanup_connection();
+                        return;
                     }
 
                     // Log periodically (every 100 drops)
@@ -234,8 +221,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             } catch (const std::exception& e) {
                 CASPAR_LOG(error) << L"WebSocket monitor session send error: " << u16(e.what());
                 self->is_open_ = false;
-                if (self->monitor_client_)
-                    self->monitor_client_->remove_connection(self->connection_id_);
+                self->perform_cleanup();
             }
         });
     }
@@ -256,13 +242,8 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                 }
             }
 
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e.what());
-                }
-            }
+            // Perform cleanup (remove from monitor client)
+            perform_cleanup();
 
             try {
                 // Graceful close
@@ -306,6 +287,18 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
     }
 
   private:
+    // Simple cleanup helper - just remove from monitor client
+    void cleanup_connection()
+    {
+        if (monitor_client_) {
+            try {
+                monitor_client_->remove_connection(connection_id_);
+            } catch (const std::exception& e) {
+                CASPAR_LOG(error) << L"WebSocket monitor session cleanup error: " << u16(e.what());
+            }
+        }
+    }
+
     std::string generate_connection_id()
     {
         try {
@@ -349,13 +342,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             CASPAR_LOG(error) << L"WebSocket monitor session on_accept error: " << u16(e.what());
             is_open_ = false;
             // Try to clean up if possible
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e2) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session cleanup error: " << u16(e2.what());
-                }
-            }
+            perform_cleanup();
         }
     }
 
@@ -373,13 +360,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         } catch (const std::exception& e) {
             CASPAR_LOG(error) << L"WebSocket monitor session do_read error: " << u16(e.what());
             is_open_ = false;
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e2) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e2.what());
-                }
-            }
+            perform_cleanup();
         }
     }
 
@@ -392,26 +373,14 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             CASPAR_LOG(info) << L"WebSocket monitor session closed: " << u16(connection_id_) << L" ("
                              << u16(client_address_) << L")";
             is_open_ = false;
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e.what());
-                }
-            }
+            perform_cleanup();
             return;
         }
 
         if (ec) {
             CASPAR_LOG(error) << L"WebSocket monitor session read error: " << u16(ec.message());
             is_open_ = false;
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e.what());
-                }
-            }
+            perform_cleanup();
             return;
         }
 
@@ -434,13 +403,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         } catch (const std::exception& e) {
             CASPAR_LOG(error) << L"WebSocket monitor session buffer handling error: " << u16(e.what());
             is_open_ = false;
-            if (monitor_client_) {
-                try {
-                    monitor_client_->remove_connection(connection_id_);
-                } catch (const std::exception& e2) {
-                    CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e2.what());
-                }
-            }
+            perform_cleanup();
         }
     }
 
@@ -464,18 +427,12 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             // Check if we've had sustained failures for too long
             auto failure_duration = std::chrono::duration_cast<std::chrono::seconds>(now - first_failure_time_).count();
 
-            if (failure_duration >= SUSTAINED_FAILURE_SECONDS) {
+            if (failure_duration >= SUSTAINED_DROP_SECONDS) {
                 CASPAR_LOG(warning) << L"WebSocket monitor: client " << u16(connection_id_) << L" ("
                                     << u16(client_address_) << L") had sustained failures for " << failure_duration
                                     << L" seconds. Closing connection.";
                 is_open_ = false;
-                if (monitor_client_) {
-                    try {
-                        monitor_client_->remove_connection(connection_id_);
-                    } catch (const std::exception& e) {
-                        CASPAR_LOG(error) << L"WebSocket monitor session remove connection error: " << u16(e.what());
-                    }
-                }
+                perform_cleanup();
                 return;
             }
 
@@ -507,6 +464,8 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                                  << L"(total dropped: " << total_dropped << L")";
                 has_drops_ = false;
                 total_messages_dropped_.store(0); // Reset the counter
+                // Reset first_drop_time_ so we start fresh if drops resume
+                first_drop_time_ = std::chrono::steady_clock::time_point{};
             }
         }
 
@@ -624,21 +583,7 @@ class websocket_monitor_listener : public std::enable_shared_from_this<websocket
             }
         } else {
             // Create the session and run it
-            auto session = std::make_shared<websocket_monitor_session>(
-                ioc_,
-                std::move(socket),
-                monitor_client_,
-                [this, weak_self = std::weak_ptr<websocket_monitor_listener>(this->shared_from_this())](
-                    std::shared_ptr<websocket_monitor_session> session) {
-                    // Remove session from tracking when it's destroyed (lock-free)
-                    auto self = weak_self.lock();
-                    if (self) {
-                        tbb::concurrent_hash_map<std::shared_ptr<websocket_monitor_session>, bool>::accessor acc;
-                        if (self->active_sessions_.find(acc, session)) {
-                            self->active_sessions_.erase(acc);
-                        }
-                    }
-                });
+            auto session = std::make_shared<websocket_monitor_session>(ioc_, std::move(socket), monitor_client_);
 
             // Track the session (lock-free)
             tbb::concurrent_hash_map<std::shared_ptr<websocket_monitor_session>, bool>::accessor acc;
