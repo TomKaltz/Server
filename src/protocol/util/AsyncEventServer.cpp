@@ -148,12 +148,16 @@ class connection : public spl::enable_shared_from_this<connection>
 
     void disconnect()
     {
-        std::weak_ptr<connection> self = shared_from_this();
+        auto                      self_shared = shared_from_this(); // This is spl::shared_ptr<connection>
+        std::weak_ptr<connection> self(self_shared);                // Convert to std::weak_ptr for the lambda
         boost::asio::dispatch(*io_context_, [=] {
             auto strong = self.lock();
 
-            if (strong)
+            if (strong) {
+                // Remove from connection set using the spl::shared_ptr
+                connection_set_->erase(self_shared);
                 strong->stop();
+            }
         });
     }
 
@@ -187,7 +191,8 @@ class connection : public spl::enable_shared_from_this<connection>
 
     void stop() // always called from the asio-service-thread
     {
-        connection_set_->erase(shared_from_this());
+        // Don't call shared_from_this() here as this can be called during destruction
+        // The connection set cleanup should be handled by the caller
 
         CASPAR_LOG(info) << print() << L" Client " << ipv4_address() << L" disconnected (" << connection_set_->size()
                          << L" connections).";

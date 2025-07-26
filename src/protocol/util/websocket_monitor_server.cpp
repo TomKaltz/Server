@@ -221,7 +221,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             } catch (const std::exception& e) {
                 CASPAR_LOG(error) << L"WebSocket monitor session send error: " << u16(e.what());
                 self->is_open_ = false;
-                self->perform_cleanup();
+                self->cleanup_connection();
             }
         });
     }
@@ -243,7 +243,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             }
 
             // Perform cleanup (remove from monitor client)
-            perform_cleanup();
+            cleanup_connection();
 
             try {
                 // Graceful close
@@ -342,7 +342,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             CASPAR_LOG(error) << L"WebSocket monitor session on_accept error: " << u16(e.what());
             is_open_ = false;
             // Try to clean up if possible
-            perform_cleanup();
+            cleanup_connection();
         }
     }
 
@@ -360,7 +360,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         } catch (const std::exception& e) {
             CASPAR_LOG(error) << L"WebSocket monitor session do_read error: " << u16(e.what());
             is_open_ = false;
-            perform_cleanup();
+            cleanup_connection();
         }
     }
 
@@ -373,14 +373,14 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             CASPAR_LOG(info) << L"WebSocket monitor session closed: " << u16(connection_id_) << L" ("
                              << u16(client_address_) << L")";
             is_open_ = false;
-            perform_cleanup();
+            cleanup_connection();
             return;
         }
 
         if (ec) {
             CASPAR_LOG(error) << L"WebSocket monitor session read error: " << u16(ec.message());
             is_open_ = false;
-            perform_cleanup();
+            cleanup_connection();
             return;
         }
 
@@ -403,7 +403,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         } catch (const std::exception& e) {
             CASPAR_LOG(error) << L"WebSocket monitor session buffer handling error: " << u16(e.what());
             is_open_ = false;
-            perform_cleanup();
+            cleanup_connection();
         }
     }
 
@@ -432,7 +432,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                                     << u16(client_address_) << L") had sustained failures for " << failure_duration
                                     << L" seconds. Closing connection.";
                 is_open_ = false;
-                perform_cleanup();
+                cleanup_connection();
                 return;
             }
 
