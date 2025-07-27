@@ -424,8 +424,13 @@ com_ptr<IDeckLinkDisplayMode> get_display_mode(const com_iface_ptr<IDeckLinkInpu
     BMDDisplayMode actualMode = bmdModeUnknown;
     BOOL           supported  = false;
 
-    if (FAILED(device->DoesSupportVideoMode(
-            bmdVideoConnectionUnspecified, mode->GetDisplayMode(), pix_fmt, bmdNoVideoInputConversion, flag, &actualMode, &supported)))
+    if (FAILED(device->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+                                            mode->GetDisplayMode(),
+                                            pix_fmt,
+                                            bmdNoVideoInputConversion,
+                                            flag,
+                                            &actualMode,
+                                            &supported)))
         CASPAR_THROW_EXCEPTION(caspar_exception()
                                << msg_info(L"Could not determine whether device supports requested video format: " +
                                            get_mode_name(mode)));
@@ -548,8 +553,10 @@ class decklink_producer : public IDeckLinkInputCallback
         }
 
         if (FAILED(input_->EnableVideoInput(mode_->GetDisplayMode(), get_pixel_format2(hdr_), flags))) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info(print() + L" Could not enable video input.")
-                                                      << boost::errinfo_api_function("EnableVideoInput"));
+            CASPAR_LOG(warning) << print()
+                                << L" Could not enable video input. This device may already be in use by another "
+                                   L"producer/consumer or application.";
+            CASPAR_THROW_EXCEPTION(expected_user_error());
         }
 
         if (FAILED(input_->EnableAudioInput(bmdAudioSampleRate48kHz,
