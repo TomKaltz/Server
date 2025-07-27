@@ -91,6 +91,7 @@ class websocket_monitor_client
     // Connection management with subscription support
     void add_connection(const std::string&                      connection_id,
                         std::function<void(const std::string&)> send_callback,
+                        std::function<bool()>                   can_send_callback,
                         const subscription_config&              subscription = subscription_config{});
 
     void remove_connection(const std::string& connection_id);

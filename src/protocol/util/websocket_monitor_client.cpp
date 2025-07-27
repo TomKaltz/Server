@@ -596,12 +596,17 @@ struct connection_info
 {
     std::string                             connection_id;
     std::function<void(const std::string&)> send_callback;
+    std::function<bool()>                   can_send_callback; // Check if connection can accept messages
     subscription_config                     subscription;
     caspar::core::monitor::state            last_state;
 
-    connection_info(std::string id, std::function<void(const std::string&)> callback, subscription_config sub)
+    connection_info(std::string                             id,
+                    std::function<void(const std::string&)> callback,
+                    std::function<bool()>                   can_send,
+                    subscription_config                     sub)
         : connection_id(std::move(id))
         , send_callback(std::move(callback))
+        , can_send_callback(std::move(can_send))
         , subscription(std::move(sub))
     {
     }
@@ -637,11 +642,13 @@ struct websocket_monitor_client::impl
 
     void add_connection(const std::string&                      connection_id,
                         std::function<void(const std::string&)> send_callback,
+                        std::function<bool()>                   can_send_callback,
                         const subscription_config&              subscription)
     {
         tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
         connections_.insert(acc, connection_id);
-        acc->second = std::make_unique<connection_info>(connection_id, std::move(send_callback), subscription);
+        acc->second = std::make_unique<connection_info>(
+            connection_id, std::move(send_callback), std::move(can_send_callback), subscription);
         CASPAR_LOG(info) << L"WebSocket monitor: Added connection " << u16(connection_id) << L" ("
                          << connections_.size() << L" total connections) with subscription";
     }
@@ -724,6 +731,14 @@ struct websocket_monitor_client::impl
 
         // JSON serialization
         if (filtered_state.begin() != filtered_state.end()) {
+            // CRITICAL FIX: Check if connection can send BEFORE expensive JSON serialization
+            if (!conn->can_send_callback || !conn->can_send_callback()) {
+                CASPAR_LOG(debug) << L"WebSocket monitor: Skipping JSON serialization for connection "
+                                  << u16(conn->connection_id)
+                                  << L" - connection cannot accept messages (prevents memory waste)";
+                return; // No memory waste!
+            }
+
             std::string json = monitor_state_to_osc_json(filtered_state, "filtered_state");
 
             // Send via IO context (non-blocking)
@@ -824,9 +839,10 @@ websocket_monitor_client::~websocket_monitor_client()
 
 void websocket_monitor_client::add_connection(const std::string&                      connection_id,
                                               std::function<void(const std::string&)> send_callback,
+                                              std::function<bool()>                   can_send_callback,
                                               const subscription_config&              subscription)
 {
-    impl_->add_connection(connection_id, std::move(send_callback), subscription);
+    impl_->add_connection(connection_id, std::move(send_callback), std::move(can_send_callback), subscription);
 }
 
 void websocket_monitor_client::remove_connection(const std::string& connection_id)

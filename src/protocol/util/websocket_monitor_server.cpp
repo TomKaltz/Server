@@ -286,6 +286,9 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         }
     }
 
+    // Check if this session can accept a new message (not already writing)
+    bool can_send_message() const { return is_open_ && !write_in_flight_; }
+
   private:
     // Simple cleanup helper - just remove from monitor client
     void cleanup_connection()
@@ -323,12 +326,18 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
 
             // Register this connection with the monitor client
             auto weak_self = std::weak_ptr<websocket_monitor_session>(this->shared_from_this());
-            monitor_client_->add_connection(connection_id_, [weak_self](const std::string& message) {
-                auto self = weak_self.lock();
-                if (self) {
-                    self->send(message);
-                }
-            });
+            monitor_client_->add_connection(
+                connection_id_,
+                [weak_self](const std::string& message) {
+                    auto self = weak_self.lock();
+                    if (self) {
+                        self->send(message);
+                    }
+                },
+                [weak_self]() -> bool {
+                    auto self = weak_self.lock();
+                    return self && self->can_send_message();
+                });
 
             CASPAR_LOG(info) << L"WebSocket monitor session connected: " << u16(connection_id_) << L" ("
                              << u16(client_address_) << L")";
