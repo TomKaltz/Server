@@ -742,14 +742,17 @@ struct websocket_monitor_client::impl
             std::string json = monitor_state_to_osc_json(filtered_state, "filtered_state");
 
             // Send via IO context (non-blocking)
-            boost::asio::post(*context_, [conn, json = std::move(json)]() {
+            // CRITICAL FIX: Capture callback by value to avoid use-after-free
+            auto send_callback = conn->send_callback;
+            std::string connection_id = conn->connection_id;
+            boost::asio::post(*context_, [send_callback, connection_id, json = std::move(json)]() {
                 try {
                     // Check if the callback is still valid before calling it
-                    if (conn && conn->send_callback) {
-                        conn->send_callback(json);
+                    if (send_callback) {
+                        send_callback(json);
                     }
                 } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed: " << u16(e.what());
+                    CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(connection_id) << L": " << u16(e.what());
                 }
             });
         }
@@ -799,15 +802,18 @@ struct websocket_monitor_client::impl
                     std::string full_state_json = monitor_state_to_osc_json(*state, "full_state");
 
                     // Send via IO context (non-blocking)
-                    boost::asio::post(*context_, [conn = acc->second.get(), json = std::move(full_state_json)]() {
+                    // CRITICAL FIX: Capture callback by value to avoid use-after-free
+                    auto send_callback = acc->second->send_callback;
+                    std::string conn_id = acc->second->connection_id;
+                    boost::asio::post(*context_, [send_callback, conn_id, json = std::move(full_state_json)]() {
                         try {
                             // Check if the callback is still valid before calling it
-                            if (conn && conn->send_callback) {
-                                conn->send_callback(json);
-                                CASPAR_LOG(info) << L"WebSocket monitor: Sent full state to connection";
+                            if (send_callback) {
+                                send_callback(json);
+                                CASPAR_LOG(info) << L"WebSocket monitor: Sent full state to connection " << u16(conn_id);
                             }
                         } catch (const std::exception& e) {
-                            CASPAR_LOG(error) << L"WebSocket monitor: Failed to send full state: " << u16(e.what());
+                            CASPAR_LOG(error) << L"WebSocket monitor: Failed to send full state to " << u16(conn_id) << L": " << u16(e.what());
                         }
                     });
                 } catch (const std::exception& e) {
