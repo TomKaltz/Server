@@ -408,55 +408,73 @@ json variant_to_json_value(const caspar::core::monitor::data_t& value)
 
 void set_nested_json_value(json& root, const std::string& path, const caspar::core::monitor::vector_t& values)
 {
-    std::list<std::string> path_parts;
-    boost::split(path_parts, path, boost::is_any_of("/"));
+    try {
+        std::list<std::string> path_parts;
+        boost::split(path_parts, path, boost::is_any_of("/"));
 
-    json* current = &root;
-    for (auto it = path_parts.begin(); it != path_parts.end(); ++it) {
-        if (it->empty())
-            continue;
+        json* current = &root;
+        for (auto it = path_parts.begin(); it != path_parts.end(); ++it) {
+            if (it->empty())
+                continue;
 
-        if (std::next(it) == path_parts.end()) {
-            // Leaf node - set the value
-            if (values.size() == 1) {
-                (*current)[*it] = variant_to_json_value(values[0]);
-            } else {
-                json array = json::array();
-                for (const auto& value : values) {
-                    array.push_back(variant_to_json_value(value));
+            if (std::next(it) == path_parts.end()) {
+                // Leaf node - set the value
+                if (values.size() == 1) {
+                    (*current)[*it] = variant_to_json_value(values[0]);
+                } else {
+                    json array = json::array();
+                    for (const auto& value : values) {
+                        array.push_back(variant_to_json_value(value));
+                    }
+                    (*current)[*it] = array;
                 }
-                (*current)[*it] = array;
+            } else {
+                // Intermediate node - create object if needed
+                if (!current->contains(*it)) {
+                    (*current)[*it] = json::object();
+                }
+                current = &(*current)[*it];
             }
-        } else {
-            // Intermediate node - create object if needed
-            if (!current->contains(*it)) {
-                (*current)[*it] = json::object();
-            }
-            current = &(*current)[*it];
         }
+    } catch (const std::bad_alloc& e) {
+        CASPAR_LOG(error) << L"WebSocket monitor: Memory allocation failed in set_nested_json_value for path: " << u16(path) << L": " << u16(e.what());
+        throw; // Re-throw to be caught by the caller
+    } catch (const std::exception& e) {
+        CASPAR_LOG(error) << L"WebSocket monitor: Exception in set_nested_json_value for path: " << u16(path) << L": " << u16(e.what());
+        throw; // Re-throw to be caught by the caller
     }
 }
 
 // Convert monitor state to OSC-style JSON structure
 std::string monitor_state_to_osc_json(const caspar::core::monitor::state& state, const std::string& message_type)
 {
-    json root;
+    try {
+        json root;
 
-    // Add message metadata
-    root["type"] = message_type;
-    root["timestamp"] =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count();
+        // Add message metadata
+        root["type"] = message_type;
+        root["timestamp"] =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count();
 
-    // Convert monitor state to nested JSON structure
-    json data_node = json::object();
-    for (const auto& [path, values] : state) {
-        set_nested_json_value(data_node, path, values);
+        // Convert monitor state to nested JSON structure
+        json data_node = json::object();
+        for (const auto& [path, values] : state) {
+            set_nested_json_value(data_node, path, values);
+        }
+
+        root["data"] = data_node;
+
+        return root.dump();
+    } catch (const std::bad_alloc& e) {
+        CASPAR_LOG(error) << L"WebSocket monitor: Memory allocation failed during JSON serialization: " << u16(e.what());
+        // Return a minimal error message to prevent further crashes
+        return "{\"type\":\"error\",\"error\":\"memory_allocation_failed\"}";
+    } catch (const std::exception& e) {
+        CASPAR_LOG(error) << L"WebSocket monitor: Exception during JSON serialization: " << u16(e.what());
+        // Return a minimal error message to prevent further crashes
+        return "{\"type\":\"error\",\"error\":\"serialization_failed\"}";
     }
-
-    root["data"] = data_node;
-
-    return root.dump();
 }
 
 // Extract specific layer numbers from subscription patterns
@@ -713,8 +731,24 @@ struct websocket_monitor_client::impl
             auto conn = it->second;
             // Check if connection exists and is valid before processing
             if (conn && conn->valid()) {
+                // Additional safety check: verify connection still exists in the map
+                tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::const_accessor check_acc;
+                if (!connections_.find(check_acc, conn->connection_id) || check_acc->second != conn) {
+                    // Connection was removed while we were processing, skip it
+                    continue;
+                }
+                
                 try {
                     process_connection_async(conn, state);
+                } catch (const std::bad_alloc& e) {
+                    CASPAR_LOG(error) << L"WebSocket monitor: Memory allocation failed for connection " << u16(conn->connection_id) << L": "
+                                      << u16(e.what()) << L" - marking connection as invalid";
+                    // Mark connection as invalid on memory allocation failure
+                    conn->invalidate();
+                    tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
+                    if (connections_.find(acc, conn->connection_id)) {
+                        connections_.erase(acc);
+                    }
                 } catch (const std::exception& e) {
                     CASPAR_LOG(error) << L"WebSocket monitor: Failed to process connection " << u16(conn->connection_id) << L": "
                                       << u16(e.what());
@@ -736,47 +770,57 @@ struct websocket_monitor_client::impl
             return;
         }
 
-        // Expensive operations happen here, not in channel thread
-        caspar::core::monitor::state filtered_state;
+        try {
+            // Expensive operations happen here, not in channel thread
+            caspar::core::monitor::state filtered_state;
 
-        // Pattern matching and filtering
-        for (const auto& [path, values] : state) {
-            if (conn->subscription.should_include(path)) {
-                auto filtered_values = conn->subscription.apply_array_filters(path, values);
-                filtered_state[path] = filtered_values;
-            }
-        }
-
-        // JSON serialization
-        if (filtered_state.begin() != filtered_state.end()) {
-            // CRITICAL FIX: Check validity and can_send BEFORE expensive JSON serialization
-            if (!conn->valid() || !conn->can_send_callback || !conn->can_send_callback()) {
-                CASPAR_LOG(debug) << L"WebSocket monitor: Skipping JSON serialization for connection "
-                                  << u16(conn->connection_id)
-                                  << L" - connection invalid or cannot accept messages";
-                return;
-            }
-
-            std::string json = monitor_state_to_osc_json(filtered_state, "filtered_state");
-
-            // Send via IO context (non-blocking) with shared ownership
-            boost::asio::post(*context_, [conn, json = std::move(json)]() {
-                try {
-                    // CRITICAL FIX: Double-check validity before sending
-                    if (conn && conn->valid() && conn->send_callback) {
-                        conn->send_callback(json);
-                    }
-                } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(conn->connection_id) << L": " << u16(e.what());
-                    // Mark connection as invalid on send failure
-                    if (conn) {
-                        conn->invalidate();
-                    }
+            // Pattern matching and filtering
+            for (const auto& [path, values] : state) {
+                if (conn->subscription.should_include(path)) {
+                    auto filtered_values = conn->subscription.apply_array_filters(path, values);
+                    filtered_state[path] = filtered_values;
                 }
-            });
-        }
+            }
 
-        conn->last_state = state;
+            // JSON serialization
+            if (filtered_state.begin() != filtered_state.end()) {
+                // CRITICAL FIX: Check validity and can_send BEFORE expensive JSON serialization
+                if (!conn->valid() || !conn->can_send_callback || !conn->can_send_callback()) {
+                    CASPAR_LOG(debug) << L"WebSocket monitor: Skipping JSON serialization for connection "
+                                      << u16(conn->connection_id)
+                                      << L" - connection invalid or cannot accept messages";
+                    return;
+                }
+
+                std::string json = monitor_state_to_osc_json(filtered_state, "filtered_state");
+
+                // Send via IO context (non-blocking) with shared ownership
+                boost::asio::post(*context_, [conn, json = std::move(json)]() {
+                    try {
+                        // CRITICAL FIX: Double-check validity before sending
+                        if (conn && conn->valid() && conn->send_callback) {
+                            conn->send_callback(json);
+                        }
+                    } catch (const std::exception& e) {
+                        CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(conn->connection_id) << L": " << u16(e.what());
+                        // Mark connection as invalid on send failure
+                        if (conn) {
+                            conn->invalidate();
+                        }
+                    }
+                });
+            }
+
+            conn->last_state = state;
+        } catch (const std::bad_alloc& e) {
+            CASPAR_LOG(error) << L"WebSocket monitor: Memory allocation failed in process_connection_async for " << u16(conn->connection_id) << L": " << u16(e.what());
+            // Re-throw to be caught by the caller
+            throw;
+        } catch (const std::exception& e) {
+            CASPAR_LOG(error) << L"WebSocket monitor: Exception in process_connection_async for " << u16(conn->connection_id) << L": " << u16(e.what());
+            // Re-throw to be caught by the caller
+            throw;
+        }
     }
 
   public:
