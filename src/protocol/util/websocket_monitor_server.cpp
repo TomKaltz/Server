@@ -53,6 +53,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <atomic> // Added for std::atomic
 
 namespace beast = boost::beast;
 namespace http  = beast::http;
@@ -74,6 +75,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
     std::unique_ptr<boost::asio::deadline_timer> force_close_timer_;
     boost::asio::io_context&                     io_context_;
     bool                                         write_in_flight_{false};
+    std::atomic<bool>                            is_destroying_{false}; // Track destruction state
 
     // Simple timeout for sustained message dropping
     static constexpr int SUSTAINED_DROP_SECONDS = 30; // Close connection after 30 seconds of continuous drops
@@ -108,6 +110,9 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
 
     ~websocket_monitor_session()
     {
+        // Mark as destroying to prevent further operations
+        is_destroying_.store(true);
+        
         // Ensure we're marked as closed
         is_open_ = false;
 
@@ -120,8 +125,10 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             }
         }
 
-        // Simple cleanup - just remove from monitor client
-        cleanup_connection();
+        // Safe cleanup - only remove from monitor client if we're not already destroying
+        if (!is_destroying_.load()) {
+            cleanup_connection();
+        }
     }
 
     void run()
@@ -250,7 +257,7 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                 auto weak_self = std::weak_ptr<websocket_monitor_session>(this->shared_from_this());
                 ws_.async_close(ws::close_code::normal, [weak_self](beast::error_code ec) {
                     auto self = weak_self.lock();
-                    if (self) {
+                    if (self && !self->is_destroying_.load()) {
                         if (ec) {
                             CASPAR_LOG(error) << L"WebSocket monitor session close error: " << u16(ec.message());
                         } else {
@@ -261,17 +268,21 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                     }
                 });
 
-                // Start force close timer (1 second)
+                // Start force close timer (1 second) with proper weak_ptr handling
                 if (!force_close_timer_) {
                     force_close_timer_ = std::make_unique<boost::asio::deadline_timer>(io_context_);
                 }
                 force_close_timer_->expires_from_now(boost::posix_time::seconds(1));
                 force_close_timer_->async_wait([weak_self](const boost::system::error_code& ec) {
                     auto self = weak_self.lock();
-                    if (self && !ec && self->ws_.is_open()) {
+                    if (self && !ec && !self->is_destroying_.load() && self->ws_.is_open()) {
                         CASPAR_LOG(warning) << L"WebSocket monitor session forcefully closed: "
                                             << u16(self->connection_id_) << L" (" << u16(self->client_address_) << L")";
-                        self->ws_.next_layer().close();
+                        try {
+                            self->ws_.next_layer().close();
+                        } catch (const std::exception& e) {
+                            CASPAR_LOG(error) << L"WebSocket monitor session force close error: " << u16(e.what());
+                        }
                     }
                 });
             } catch (const std::exception& e) {
@@ -293,6 +304,11 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
     // Simple cleanup helper - just remove from monitor client
     void cleanup_connection()
     {
+        // CRITICAL FIX: Check if we're destroying to prevent use-after-free
+        if (is_destroying_.load()) {
+            return;
+        }
+        
         if (monitor_client_) {
             try {
                 monitor_client_->remove_connection(connection_id_);

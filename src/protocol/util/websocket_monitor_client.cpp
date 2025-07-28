@@ -599,6 +599,7 @@ struct connection_info
     std::function<bool()>                   can_send_callback; // Check if connection can accept messages
     subscription_config                     subscription;
     caspar::core::monitor::state            last_state;
+    std::atomic<bool>                       is_valid{true}; // Track if connection is still valid
 
     connection_info(std::string                             id,
                     std::function<void(const std::string&)> callback,
@@ -610,6 +611,10 @@ struct connection_info
         , subscription(std::move(sub))
     {
     }
+    
+    // Mark connection as invalid to prevent further use
+    void invalidate() { is_valid.store(false); }
+    bool valid() const { return is_valid.load(); }
 };
 
 struct websocket_monitor_client::impl
@@ -622,8 +627,8 @@ struct websocket_monitor_client::impl
     // Lock-free state storage
     std::atomic<caspar::core::monitor::state*> current_state_{nullptr};
 
-    // Thread-safe connection management (no mutex needed)
-    tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>> connections_;
+    // Thread-safe connection management with shared ownership
+    tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>> connections_;
 
     std::atomic<bool> shutdown_requested_{false};
     std::atomic<bool> shutdown_completed_{false};
@@ -645,9 +650,9 @@ struct websocket_monitor_client::impl
                         std::function<bool()>                   can_send_callback,
                         const subscription_config&              subscription)
     {
-        tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
+        tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
         connections_.insert(acc, connection_id);
-        acc->second = std::make_unique<connection_info>(
+        acc->second = std::make_shared<connection_info>(
             connection_id, std::move(send_callback), std::move(can_send_callback), subscription);
         CASPAR_LOG(info) << L"WebSocket monitor: Added connection " << u16(connection_id) << L" ("
                          << connections_.size() << L" total connections) with subscription";
@@ -655,8 +660,10 @@ struct websocket_monitor_client::impl
 
     void remove_connection(const std::string& connection_id)
     {
-        tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
+        tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
         if (connections_.find(acc, connection_id)) {
+            // Mark connection as invalid before removing to prevent race conditions
+            acc->second->invalidate();
             connections_.erase(acc);
         }
         CASPAR_LOG(info) << L"WebSocket monitor: Removed connection " << u16(connection_id) << L" ("
@@ -665,10 +672,12 @@ struct websocket_monitor_client::impl
 
     void update_subscription(const std::string& connection_id, const subscription_config& subscription)
     {
-        tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
+        tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
         if (connections_.find(acc, connection_id)) {
-            acc->second->subscription = subscription;
-            CASPAR_LOG(info) << L"WebSocket monitor: Updated subscription for connection " << u16(connection_id);
+            if (acc->second->valid()) {
+                acc->second->subscription = subscription;
+                CASPAR_LOG(info) << L"WebSocket monitor: Updated subscription for connection " << u16(connection_id);
+            }
         } else {
             CASPAR_LOG(warning) << L"WebSocket monitor: Connection not found for subscription update: "
                                 << u16(connection_id);
@@ -698,26 +707,35 @@ struct websocket_monitor_client::impl
         auto* old_state = current_state_.exchange(new_state);
         delete old_state;
 
-        // Process each connection independently
-        for (tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::iterator it =
-                 connections_.begin();
-             it != connections_.end();
-             ++it) {
-            try {
-                process_connection_async(it->second.get(), state);
-            } catch (const std::exception& e) {
-                CASPAR_LOG(error) << L"WebSocket monitor: Failed to process connection " << u16(it->first) << L": "
-                                  << u16(e.what());
-                tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
-                if (connections_.find(acc, it->first)) {
-                    connections_.erase(acc);
+        // Iterate safely over connections using shared ownership and validity checks
+        // Avoid collecting into a vector for better performance
+        for (auto it = connections_.begin(); it != connections_.end(); ++it) {
+            auto conn = it->second;
+            // Check if connection exists and is valid before processing
+            if (conn && conn->valid()) {
+                try {
+                    process_connection_async(conn, state);
+                } catch (const std::exception& e) {
+                    CASPAR_LOG(error) << L"WebSocket monitor: Failed to process connection " << u16(conn->connection_id) << L": "
+                                      << u16(e.what());
+                    // Mark connection as invalid and attempt removal
+                    conn->invalidate();
+                    tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
+                    if (connections_.find(acc, conn->connection_id)) {
+                        connections_.erase(acc);
+                    }
                 }
             }
         }
     }
 
-    void process_connection_async(connection_info* conn, const caspar::core::monitor::state& state)
+    void process_connection_async(std::shared_ptr<connection_info> conn, const caspar::core::monitor::state& state)
     {
+        // CRITICAL FIX: Check validity first
+        if (!conn || !conn->valid()) {
+            return;
+        }
+
         // Expensive operations happen here, not in channel thread
         caspar::core::monitor::state filtered_state;
 
@@ -731,28 +749,29 @@ struct websocket_monitor_client::impl
 
         // JSON serialization
         if (filtered_state.begin() != filtered_state.end()) {
-            // CRITICAL FIX: Check if connection can send BEFORE expensive JSON serialization
-            if (!conn->can_send_callback || !conn->can_send_callback()) {
+            // CRITICAL FIX: Check validity and can_send BEFORE expensive JSON serialization
+            if (!conn->valid() || !conn->can_send_callback || !conn->can_send_callback()) {
                 CASPAR_LOG(debug) << L"WebSocket monitor: Skipping JSON serialization for connection "
                                   << u16(conn->connection_id)
-                                  << L" - connection cannot accept messages (prevents memory waste)";
-                return; // No memory waste!
+                                  << L" - connection invalid or cannot accept messages";
+                return;
             }
 
             std::string json = monitor_state_to_osc_json(filtered_state, "filtered_state");
 
-            // Send via IO context (non-blocking)
-            // CRITICAL FIX: Capture callback by value to avoid use-after-free
-            auto send_callback = conn->send_callback;
-            std::string connection_id = conn->connection_id;
-            boost::asio::post(*context_, [send_callback, connection_id, json = std::move(json)]() {
+            // Send via IO context (non-blocking) with shared ownership
+            boost::asio::post(*context_, [conn, json = std::move(json)]() {
                 try {
-                    // Check if the callback is still valid before calling it
-                    if (send_callback) {
-                        send_callback(json);
+                    // CRITICAL FIX: Double-check validity before sending
+                    if (conn && conn->valid() && conn->send_callback) {
+                        conn->send_callback(json);
                     }
                 } catch (const std::exception& e) {
-                    CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(connection_id) << L": " << u16(e.what());
+                    CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(conn->connection_id) << L": " << u16(e.what());
+                    // Mark connection as invalid on send failure
+                    if (conn) {
+                        conn->invalidate();
+                    }
                 }
             });
         }
@@ -780,6 +799,12 @@ struct websocket_monitor_client::impl
 
     void force_disconnect_all()
     {
+        // Mark all connections as invalid first
+        for (auto it = connections_.begin(); it != connections_.end(); ++it) {
+            if (it->second) {
+                it->second->invalidate();
+            }
+        }
         connections_.clear();
         CASPAR_LOG(info) << L"WebSocket monitor: Force disconnected all connections";
     }
@@ -796,24 +821,30 @@ struct websocket_monitor_client::impl
                 return;
             }
 
-            tbb::concurrent_hash_map<std::string, std::unique_ptr<connection_info>>::accessor acc;
+            tbb::concurrent_hash_map<std::string, std::shared_ptr<connection_info>>::accessor acc;
             if (connections_.find(acc, connection_id)) {
+                auto conn = acc->second;
+                if (!conn || !conn->valid()) {
+                    return;
+                }
+
                 try {
                     std::string full_state_json = monitor_state_to_osc_json(*state, "full_state");
 
-                    // Send via IO context (non-blocking)
-                    // CRITICAL FIX: Capture callback by value to avoid use-after-free
-                    auto send_callback = acc->second->send_callback;
-                    std::string conn_id = acc->second->connection_id;
-                    boost::asio::post(*context_, [send_callback, conn_id, json = std::move(full_state_json)]() {
+                    // Send via IO context (non-blocking) with shared ownership
+                    boost::asio::post(*context_, [conn, json = std::move(full_state_json)]() {
                         try {
-                            // Check if the callback is still valid before calling it
-                            if (send_callback) {
-                                send_callback(json);
-                                CASPAR_LOG(info) << L"WebSocket monitor: Sent full state to connection " << u16(conn_id);
+                            // CRITICAL FIX: Check validity before sending
+                            if (conn && conn->valid() && conn->send_callback) {
+                                conn->send_callback(json);
+                                CASPAR_LOG(info) << L"WebSocket monitor: Sent full state to connection " << u16(conn->connection_id);
                             }
                         } catch (const std::exception& e) {
-                            CASPAR_LOG(error) << L"WebSocket monitor: Failed to send full state to " << u16(conn_id) << L": " << u16(e.what());
+                            CASPAR_LOG(error) << L"WebSocket monitor: Failed to send full state to " << u16(conn->connection_id) << L": " << u16(e.what());
+                            // Mark connection as invalid on send failure
+                            if (conn) {
+                                conn->invalidate();
+                            }
                         }
                     });
                 } catch (const std::exception& e) {

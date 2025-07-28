@@ -38,6 +38,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <atomic> // Added for std::atomic
 
 namespace beast     = boost::beast;
 namespace http      = beast::http;
@@ -106,6 +107,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
     std::mutex                                    mutex_;
     beast::flat_buffer                            buffer_;
     std::shared_ptr<protocol_strategy<wchar_t>>   strategy_;
+    std::atomic<bool>                             is_valid_{true}; // Track session validity
 
     // Client connection holder for protocol strategy
     class connection_holder : public client_connection<wchar_t>
@@ -121,7 +123,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         void send(std::basic_string<wchar_t>&& data, bool skip_log) override
         {
             auto session = session_.lock();
-            if (session) {
+            if (session && session->is_valid_.load()) {
                 session->send(std::move(data), skip_log);
             }
         }
@@ -129,7 +131,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         void disconnect() override
         {
             auto session = session_.lock();
-            if (session) {
+            if (session && session->is_valid_.load()) {
                 session->disconnect();
             }
         }
@@ -137,7 +139,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         std::wstring address() const override
         {
             auto session = session_.lock();
-            if (session) {
+            if (session && session->is_valid_.load()) {
                 return session->address();
             }
             return L"[destroyed-session]";
@@ -146,7 +148,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         void add_lifecycle_bound_object(const std::wstring& key, const std::shared_ptr<void>& lifecycle_bound) override
         {
             auto session = session_.lock();
-            if (session) {
+            if (session && session->is_valid_.load()) {
                 session->add_lifecycle_bound_object(key, lifecycle_bound);
             }
         }
@@ -154,7 +156,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         std::shared_ptr<void> remove_lifecycle_bound_object(const std::wstring& key) override
         {
             auto session = session_.lock();
-            if (session) {
+            if (session && session->is_valid_.load()) {
                 return session->remove_lifecycle_bound_object(key);
             }
             return std::shared_ptr<void>();
@@ -167,6 +169,15 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
     {
         auto endpoint = ws_.next_layer().remote_endpoint();
         address_      = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+    }
+
+    ~websocket_amcp_session()
+    {
+        // Mark as invalid to prevent further operations
+        is_valid_.store(false);
+        
+        // Clear strategy to prevent use-after-free
+        strategy_.reset();
     }
 
     void start(const protocol_strategy_factory<wchar_t>::ptr& strategy_factory)
@@ -185,7 +196,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
 
         // Accept the websocket handshake
         ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
-            if (!ec) {
+            if (!ec && self->is_valid_.load()) {
                 self->do_read();
             } else {
                 CASPAR_LOG(error) << L"WebSocket AMCP accept failed: " << u16(ec.message());
@@ -195,10 +206,16 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
 
     void send(std::wstring&& data, bool skip_log)
     {
+        // CRITICAL FIX: Check validity before posting work
+        if (!is_valid_.load()) {
+            return;
+        }
+        
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self, data = std::move(data), skip_log]() mutable {
             try {
-                if (self->ws_.is_open()) {
+                // CRITICAL FIX: Double-check validity before sending
+                if (self->is_valid_.load() && self->ws_.is_open()) {
                     std::string utf8_data = u8(data);
                     self->ws_.write(net::buffer(utf8_data));
 
@@ -220,6 +237,9 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
 
     void disconnect()
     {
+        // CRITICAL FIX: Mark as invalid first
+        is_valid_.store(false);
+        
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self]() {
             try {
@@ -236,12 +256,22 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
 
     void add_lifecycle_bound_object(const std::wstring& key, const std::shared_ptr<void>& lifecycle_bound)
     {
+        // CRITICAL FIX: Check validity before accessing lifecycle objects
+        if (!is_valid_.load()) {
+            return;
+        }
+        
         std::lock_guard<std::mutex> lock(mutex_);
         lifecycle_objects_[key] = lifecycle_bound;
     }
 
     std::shared_ptr<void> remove_lifecycle_bound_object(const std::wstring& key)
     {
+        // CRITICAL FIX: Check validity before accessing lifecycle objects
+        if (!is_valid_.load()) {
+            return std::shared_ptr<void>();
+        }
+        
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = lifecycle_objects_.find(key);
         if (it != lifecycle_objects_.end()) {
@@ -255,9 +285,15 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
   private:
     void do_read()
     {
+        // CRITICAL FIX: Check validity before starting read operation
+        if (!is_valid_.load()) {
+            return;
+        }
+        
         auto self = shared_from_this();
         ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t bytes_transferred) {
-            if (!ec) {
+            // CRITICAL FIX: Check validity before processing read result
+            if (!ec && self->is_valid_.load()) {
                 try {
                     std::string message = beast::buffers_to_string(self->buffer_.data());
                     self->buffer_.consume(bytes_transferred);
@@ -269,7 +305,8 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
                     CASPAR_LOG(info) << L"WebSocket received message: [" << wide_msg << L"] (length: "
                                      << wide_msg.length() << L")";
 
-                    if (self->strategy_.get()) {
+                    // CRITICAL FIX: Check validity and strategy before parsing
+                    if (self->is_valid_.load() && self->strategy_.get()) {
                         // Ensure the message ends with AMCP delimiter
                         if (!wide_msg.empty() && !boost::algorithm::ends_with(wide_msg, L"\r\n")) {
                             wide_msg += L"\r\n";
@@ -277,10 +314,16 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
                         self->strategy_->parse(wide_msg);
                     }
 
-                    // Continue reading
-                    self->do_read();
+                    // Continue reading only if still valid
+                    if (self->is_valid_.load()) {
+                        self->do_read();
+                    }
                 } catch (const std::exception& e) {
                     CASPAR_LOG(error) << L"Error processing AMCP WebSocket message: " << u16(e.what());
+                    // Continue reading on error if still valid
+                    if (self->is_valid_.load()) {
+                        self->do_read();
+                    }
                 }
             } else if (ec != websocket::error::closed) {
                 CASPAR_LOG(error) << L"WebSocket AMCP read error: " << u16(ec.message());
@@ -294,6 +337,7 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
 {
     websocket::stream<tcp::socket> ws_;
     std::string                    address_;
+    std::atomic<bool>              is_valid_{true}; // Track session validity
 
   public:
     websocket_monitor_session(tcp::socket socket)
@@ -301,6 +345,12 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
     {
         auto endpoint = ws_.next_layer().remote_endpoint();
         address_      = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+    }
+
+    ~websocket_monitor_session()
+    {
+        // Mark as invalid to prevent further operations
+        is_valid_.store(false);
     }
 
     void start()
@@ -313,7 +363,7 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
 
         // Accept the websocket handshake
         ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
-            if (!ec) {
+            if (!ec && self->is_valid_.load()) {
                 CASPAR_LOG(info) << L"WebSocket Monitor client connected: " << u16(self->address_);
                 self->do_read();
             } else {
@@ -324,36 +374,54 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
 
     void send_monitor_data(const std::string& json_data)
     {
+        // CRITICAL FIX: Check validity before posting work
+        if (!is_valid_.load()) {
+            return;
+        }
+        
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self, json_data]() {
             try {
-                if (self->ws_.is_open()) {
+                // CRITICAL FIX: Double-check validity before sending
+                if (self->is_valid_.load() && self->ws_.is_open()) {
                     self->ws_.write(net::buffer(json_data));
                 }
             } catch (const std::exception& e) {
                 CASPAR_LOG(error) << L"Failed to send monitor data to WebSocket client: " << u16(e.what());
+                // Mark as invalid on send failure
+                self->is_valid_.store(false);
             }
         });
     }
 
-    bool is_open() const { return ws_.is_open(); }
+    bool is_open() const { return is_valid_.load() && ws_.is_open(); }
 
     std::string address() const { return address_; }
 
   private:
     void do_read()
     {
+        // CRITICAL FIX: Check validity before starting read operation
+        if (!is_valid_.load()) {
+            return;
+        }
+        
         auto self = shared_from_this();
         // Monitor connections are read-only, but we still need to handle close events
         ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t) {
             if (ec == websocket::error::closed) {
                 CASPAR_LOG(info) << L"WebSocket Monitor client disconnected: " << u16(self->address_);
+                self->is_valid_.store(false);
             } else if (ec) {
                 CASPAR_LOG(error) << L"WebSocket Monitor read error: " << u16(ec.message());
+                self->is_valid_.store(false);
             } else {
                 // Ignore incoming messages from monitor clients
                 self->buffer_.clear();
-                self->do_read();
+                // Continue reading only if still valid
+                if (self->is_valid_.load()) {
+                    self->do_read();
+                }
             }
         });
     }
@@ -485,10 +553,21 @@ struct websocket_server::impl : public spl::enable_shared_from_this<websocket_se
             // Send to all connected monitor clients and remove closed ones
             auto it = monitor_sessions_.begin();
             while (it != monitor_sessions_.end()) {
-                if ((*it)->is_open()) {
-                    (*it)->send_monitor_data(json_data);
-                    ++it;
+                auto session = *it;
+                
+                // CRITICAL FIX: Check if session is still valid and open
+                if (session && session->is_open()) {
+                    try {
+                        // Send data with timeout protection
+                        session->send_monitor_data(json_data);
+                        ++it;
+                    } catch (const std::exception& e) {
+                        CASPAR_LOG(error) << L"Failed to send monitor data to " << u16(session->address()) << L": " << u16(e.what());
+                        // Remove failed session
+                        it = monitor_sessions_.erase(it);
+                    }
                 } else {
+                    // Remove closed or invalid session
                     it = monitor_sessions_.erase(it);
                 }
             }
