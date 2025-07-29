@@ -33,12 +33,12 @@
 #include <boost/property_tree/ptree.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic> // Added for std::atomic
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <thread>
-#include <atomic> // Added for std::atomic
 
 namespace beast     = boost::beast;
 namespace http      = beast::http;
@@ -175,7 +175,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
     {
         // Mark as invalid to prevent further operations
         is_valid_.store(false);
-        
+
         // Clear strategy to prevent use-after-free
         strategy_.reset();
     }
@@ -210,7 +210,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         if (!is_valid_.load()) {
             return;
         }
-        
+
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self, data = std::move(data), skip_log]() mutable {
             try {
@@ -239,7 +239,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
     {
         // CRITICAL FIX: Mark as invalid first
         is_valid_.store(false);
-        
+
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self]() {
             try {
@@ -260,7 +260,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         if (!is_valid_.load()) {
             return;
         }
-        
+
         std::lock_guard<std::mutex> lock(mutex_);
         lifecycle_objects_[key] = lifecycle_bound;
     }
@@ -271,7 +271,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         if (!is_valid_.load()) {
             return std::shared_ptr<void>();
         }
-        
+
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = lifecycle_objects_.find(key);
         if (it != lifecycle_objects_.end()) {
@@ -289,7 +289,7 @@ class websocket_amcp_session : public spl::enable_shared_from_this<websocket_amc
         if (!is_valid_.load()) {
             return;
         }
-        
+
         auto self = shared_from_this();
         ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t bytes_transferred) {
             // CRITICAL FIX: Check validity before processing read result
@@ -378,7 +378,7 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
         if (!is_valid_.load()) {
             return;
         }
-        
+
         auto self = shared_from_this();
         net::post(ws_.get_executor(), [self, json_data]() {
             try {
@@ -405,7 +405,7 @@ class websocket_monitor_session : public spl::enable_shared_from_this<websocket_
         if (!is_valid_.load()) {
             return;
         }
-        
+
         auto self = shared_from_this();
         // Monitor connections are read-only, but we still need to handle close events
         ws_.async_read(buffer_, [self](beast::error_code ec, std::size_t) {
@@ -554,15 +554,16 @@ struct websocket_server::impl : public spl::enable_shared_from_this<websocket_se
             auto it = monitor_sessions_.begin();
             while (it != monitor_sessions_.end()) {
                 auto session = *it;
-                
+
                 // CRITICAL FIX: Check if session is still valid and open
-                if (session && session->is_open()) {
+                if (session.get() != nullptr && session->is_open()) {
                     try {
                         // Send data with timeout protection
                         session->send_monitor_data(json_data);
                         ++it;
                     } catch (const std::exception& e) {
-                        CASPAR_LOG(error) << L"Failed to send monitor data to " << u16(session->address()) << L": " << u16(e.what());
+                        CASPAR_LOG(error)
+                            << L"Failed to send monitor data to " << u16(session->address()) << L": " << u16(e.what());
                         // Remove failed session
                         it = monitor_sessions_.erase(it);
                     }
