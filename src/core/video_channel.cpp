@@ -185,6 +185,12 @@ struct video_channel::impl final
                     state["format"]      = stage_frames.format_desc.name;
                     state_               = state;
 
+                    // LATENCY DEBUGGING: Add timestamp to monitor state
+                    auto now = std::chrono::system_clock::now();
+                    auto timestamp_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                    state["timestamp"] = {static_cast<int64_t>(timestamp_ms)};
+
                     caspar::timer osc_timer;
                     tick_(state_);
                     graph_->set_value("osc-time", osc_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
@@ -231,7 +237,8 @@ struct video_channel::impl final
 
     std::wstring print() const
     {
-        return L"video_channel[" + std::to_wstring(channel_info_.index) + L"|" + stage_->video_format_desc().name + L"]";
+        return L"video_channel[" + std::to_wstring(channel_info_.index) + L"|" + stage_->video_format_desc().name +
+               L"]";
     }
 
     int index() const { return channel_info_.index; }
