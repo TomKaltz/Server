@@ -103,15 +103,16 @@ std::shared_ptr<boost::asio::io_context> create_io_context_with_running_service(
 
 struct server::impl
 {
-    std::shared_ptr<boost::asio::io_context>               io_context_ = create_io_context_with_running_service();
-    video_format_repository                                video_format_repository_;
-    accelerator::accelerator                               accelerator_;
-    std::shared_ptr<amcp::amcp_command_repository>         amcp_command_repo_;
-    std::shared_ptr<amcp::amcp_command_repository_wrapper> amcp_command_repo_wrapper_;
-    std::shared_ptr<amcp::command_context_factory>         amcp_context_factory_;
-    std::vector<spl::shared_ptr<IO::AsyncEventServer>>     async_servers_;
-    std::shared_ptr<IO::AsyncEventServer>                  primary_amcp_server_;
-    std::shared_ptr<IO::websocket_server>                  websocket_server_;
+    std::shared_ptr<boost::asio::io_context>       io_context_         = create_io_context_with_running_service();
+    std::shared_ptr<boost::asio::io_context>       monitor_io_context_ = create_io_context_with_running_service();
+    video_format_repository                        video_format_repository_;
+    accelerator::accelerator                       accelerator_;
+    std::shared_ptr<amcp::amcp_command_repository> amcp_command_repo_;
+    std::shared_ptr<amcp::amcp_command_repository_wrapper>         amcp_command_repo_wrapper_;
+    std::shared_ptr<amcp::command_context_factory>                 amcp_context_factory_;
+    std::vector<spl::shared_ptr<IO::AsyncEventServer>>             async_servers_;
+    std::shared_ptr<IO::AsyncEventServer>                          primary_amcp_server_;
+    std::shared_ptr<IO::websocket_server>                          websocket_server_;
     std::shared_ptr<protocol::websocket::websocket_monitor_client> websocket_monitor_client_shared_;
     std::atomic<protocol::websocket::websocket_monitor_client*>    websocket_monitor_client_{nullptr};
     std::shared_ptr<protocol::websocket::websocket_monitor_server> websocket_monitor_server_;
@@ -151,13 +152,16 @@ struct server::impl
         setup_amcp_command_repo();
         CASPAR_LOG(info) << L"Initialized command repository.";
 
-        // Initialize websocket monitor client (lock-free)
-        websocket_monitor_client_shared_ = std::make_shared<protocol::websocket::websocket_monitor_client>(io_context_);
+        // Initialize websocket monitor client (lock-free) with dedicated IO context
+        websocket_monitor_client_shared_ =
+            std::make_shared<protocol::websocket::websocket_monitor_client>(monitor_io_context_);
         websocket_monitor_client_.store(websocket_monitor_client_shared_.get());
 
         // Ensure the websocket_monitor_client is fully initialized before proceeding
         if (!websocket_monitor_client_.load()) {
             CASPAR_LOG(error) << L"Failed to create websocket_monitor_client";
+        } else {
+            CASPAR_LOG(info) << L"Initialized dedicated monitor IO context and WebSocket monitor client.";
         }
 
         auto xml_channels = setup_channels(env::properties());
@@ -183,8 +187,10 @@ struct server::impl
 
     ~impl()
     {
-        std::weak_ptr<boost::asio::io_context> weak_io_context = io_context_;
+        std::weak_ptr<boost::asio::io_context> weak_io_context         = io_context_;
+        std::weak_ptr<boost::asio::io_context> weak_monitor_io_context = monitor_io_context_;
         io_context_.reset();
+        monitor_io_context_.reset();
         predefined_osc_subscriptions_.clear();
         osc_client_.reset();
 
@@ -231,7 +237,7 @@ struct server::impl
         destroy_consumers_synchronously();
         channels_->clear();
 
-        while (weak_io_context.lock())
+        while (weak_io_context.lock() || weak_monitor_io_context.lock())
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         uninitialize_modules();
@@ -380,8 +386,8 @@ struct server::impl
                     if (client_ptr) {
                         try {
                             core::monitor::state complete_state = get_current_monitor_state();
-                            // CRITICAL: Post to IO context to avoid blocking video thread
-                            boost::asio::post(*io_context_, [client_ptr, state = std::move(complete_state)]() {
+                            // CRITICAL: Post to dedicated monitor IO context to avoid blocking video thread
+                            boost::asio::post(*monitor_io_context_, [client_ptr, state = std::move(complete_state)]() {
                                 try {
                                     client_ptr->send(state);
                                 } catch (const std::exception& e) {
@@ -621,9 +627,9 @@ struct server::impl
             auto amcp_port    = websocket_config->get<uint16_t>(L"amcp-port", 5251);
             auto monitor_port = websocket_config->get<uint16_t>(L"monitor-port", 5252);
 
-            // Create WebSocket monitor server (client already created earlier)
+            // Create WebSocket monitor server (client already created earlier) with dedicated IO context
             websocket_monitor_server_ = std::make_shared<protocol::websocket::websocket_monitor_server>(
-                io_context_, websocket_monitor_client_shared_, monitor_port);
+                monitor_io_context_, websocket_monitor_client_shared_, monitor_port);
 
             // Start the WebSocket monitor server
             websocket_monitor_server_->start();
