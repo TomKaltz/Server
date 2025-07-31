@@ -716,12 +716,10 @@ struct websocket_monitor_client::impl
         // Count state entries by iterating
         int state_entry_count = 0;
         for (const auto& [path, values] : state) {
-            (void)path; // Suppress unused variable warning
+            (void)path;   // Suppress unused variable warning
             (void)values; // Suppress unused variable warning
             state_entry_count++;
         }
-        CASPAR_LOG(debug) << L"WebSocket monitor: MONITOR STATE RECEIVED - connections: " << connections_.size()
-                          << L", state entries: " << state_entry_count;
 
         // CRITICAL: Never block the channel thread
         // Post to dedicated executor immediately (like AMCP command queues)
@@ -750,9 +748,6 @@ struct websocket_monitor_client::impl
         auto* new_state = new caspar::core::monitor::state(state);
         auto* old_state = current_state_.exchange(new_state);
         delete old_state;
-
-        // LATENCY DEBUGGING: Log processing start
-        CASPAR_LOG(debug) << L"WebSocket monitor: PROCESSING START - connections: " << connections_.size();
 
         // Iterate safely over connections using shared ownership and validity checks
         // Avoid collecting into a vector for better performance
@@ -791,12 +786,6 @@ struct websocket_monitor_client::impl
                 }
             }
         }
-
-        // LATENCY DEBUGGING: Log processing completion
-        auto processing_end_time = std::chrono::steady_clock::now();
-        auto processing_duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(processing_end_time - executor_start_time).count();
-        CASPAR_LOG(debug) << L"WebSocket monitor: PROCESSING COMPLETE - duration: " << processing_duration << L"ms";
     }
 
     void process_connection_async(std::shared_ptr<connection_info>      conn,
@@ -836,8 +825,6 @@ struct websocket_monitor_client::impl
             if (filtered_state.begin() != filtered_state.end()) {
                 // CRITICAL FIX: Check validity and can_send BEFORE expensive JSON serialization
                 if (!conn->valid() || !conn->can_send_callback || !conn->can_send_callback()) {
-                    CASPAR_LOG(debug) << L"WebSocket monitor: Skipping JSON serialization for connection "
-                                      << u16(conn->connection_id) << L" - connection invalid or cannot accept messages";
                     return;
                 }
 
@@ -851,16 +838,10 @@ struct websocket_monitor_client::impl
                 // Count filtered state entries by iterating
                 int filtered_entry_count = 0;
                 for (const auto& [path, values] : filtered_state) {
-                    (void)path; // Suppress unused variable warning
+                    (void)path;   // Suppress unused variable warning
                     (void)values; // Suppress unused variable warning
                     filtered_entry_count++;
                 }
-                // LATENCY DEBUGGING: Log detailed timing information
-                CASPAR_LOG(debug) << L"WebSocket monitor: CONNECTION PROCESSING - client " << u16(conn->connection_id)
-                                  << L" - total delay: " << total_delay_so_far << L"ms" << L", filtering: "
-                                  << filtering_duration << L"ms" << L", JSON: " << json_duration << L"ms"
-                                  << L", json size: " << json.length() << L" bytes" << L", filtered entries: "
-                                  << filtered_entry_count;
 
                 // Send via IO context (non-blocking) with shared ownership
                 boost::asio::post(*context_, [conn, json = std::move(json), monitor_receive_time]() {
@@ -873,18 +854,7 @@ struct websocket_monitor_client::impl
 
                         // CRITICAL FIX: Double-check validity before sending
                         if (conn && conn->valid() && conn->send_callback) {
-                            CASPAR_LOG(debug) << L"WebSocket monitor: SENDING TO CLIENT - client "
-                                              << u16(conn->connection_id) << L" - total latency: " << total_latency
-                                              << L"ms" << L", json size: " << json.length() << L" bytes";
-
                             conn->send_callback(json);
-
-                            // LATENCY DEBUGGING: Log if latency is high
-                            if (total_latency > 100) {
-                                CASPAR_LOG(warning)
-                                    << L"WebSocket monitor: HIGH LATENCY - client " << u16(conn->connection_id)
-                                    << L" - total latency: " << total_latency << L"ms";
-                            }
                         }
                     } catch (const std::exception& e) {
                         CASPAR_LOG(error) << L"WebSocket monitor: Send callback failed for " << u16(conn->connection_id)

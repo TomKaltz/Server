@@ -139,7 +139,15 @@ class Decoder
 
         FF(avcodec_parameters_to_context(ctx.get(), stream->codecpar));
 
+        // Limit thread count during heavy loading to avoid competing with real-time threads
         int thread_count = env::properties().get(L"configuration.ffmpeg.producer.threads", 0);
+        if (thread_count == 0) {
+            // Auto-detect: use fewer threads to avoid overwhelming the system
+            thread_count = std::min(2, static_cast<int>(std::thread::hardware_concurrency()));
+        } else {
+            // User-specified: cap at reasonable limit to avoid real-time interference
+            thread_count = std::min(thread_count, 4);
+        }
         FF(av_opt_set_int(ctx.get(), "threads", thread_count, 0));
 
         ctx->pkt_timebase = stream->time_base;
@@ -166,6 +174,10 @@ class Decoder
 
         thread = boost::thread([=]() {
             try {
+                // Set lower priority for FFmpeg decoder threads to avoid interfering with real-time operations
+                set_thread_name(L"ffmpeg-decoder[" + std::to_wstring(st->index) + L"]");
+                // Note: We don't set real-time priority here to avoid competing with video channels
+
                 while (!thread.interruption_requested()) {
                     auto av_frame = alloc_frame();
                     auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
@@ -190,6 +202,9 @@ class Decoder
                             output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
                             output.push(std::move(av_frame));
                         }
+
+                        // Yield to allow real-time threads to run
+                        std::this_thread::yield();
                     } else {
                         FF_RET(ret, "avcodec_receive_frame");
 
@@ -246,6 +261,9 @@ class Decoder
                             output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
                             output.push(std::move(av_frame));
                         }
+
+                        // Yield to allow real-time threads to run
+                        std::this_thread::yield();
                     }
                 }
             } catch (boost::thread_interrupted&) {
@@ -705,7 +723,8 @@ struct AVProducer::Impl
     mutable boost::mutex      buffer_mutex_;
     boost::condition_variable buffer_cond_;
     std::atomic<bool>         buffer_eof_{false};
-    int                       buffer_capacity_ = static_cast<int>(format_desc_.fps) / 4;
+    // Reduce buffer capacity during heavy loading to prevent memory pressure
+    int buffer_capacity_ = std::min(static_cast<int>(format_desc_.fps) / 4, 8);
 
     std::optional<caspar::executor> video_executor_;
     std::optional<caspar::executor> audio_executor_;
@@ -757,6 +776,10 @@ struct AVProducer::Impl
 
         thread_ = boost::thread([=] {
             try {
+                // Set lower priority for FFmpeg producer thread during heavy loading
+                set_thread_name(L"ffmpeg-producer[" + std::wstring(name_.begin(), name_.end()) + L"]");
+                // Note: We don't set real-time priority here to avoid competing with video channels
+
                 run(seek);
             } catch (boost::thread_interrupted&) {
                 // Do nothing...

@@ -125,9 +125,22 @@ struct server::impl
     spl::shared_ptr<core::frame_consumer_registry>                consumer_registry_;
     std::function<void(bool)>                                     shutdown_server_now_;
 
-    tbb::concurrent_hash_map<std::string, core::monitor::vector_t> monitor_data_;
+    // NEW ARCHITECTURE: Per-channel monitor data storage (eliminates global state contention)
+    struct channel_monitor_data
+    {
+        core::monitor::state current_state;
+        std::mutex           state_mutex;
+        std::atomic<bool>    state_updated{false};
+        std::string          channel_prefix;
+    };
+    std::vector<std::unique_ptr<channel_monitor_data>> channel_monitor_data_;
 
-    // No caching needed - we rebuild the complete state when needed
+    // Frame-synchronized WebSocket timer
+    std::unique_ptr<boost::asio::steady_timer> frame_sync_timer_;
+    std::atomic<uint64_t>                      last_frame_counter_{0};
+    std::atomic<bool>                          frame_sync_active_{false};
+
+    // REMOVED: Global monitor_data_ concurrent_hash_map that was causing all the contention
 
     impl(const impl&)            = delete;
     impl& operator=(const impl&) = delete;
@@ -167,6 +180,11 @@ struct server::impl
         auto xml_channels = setup_channels(env::properties());
         CASPAR_LOG(info) << L"Initialized channels.";
 
+        // NEW ARCHITECTURE: Initialize per-channel monitor data storage
+
+        // Start frame-synchronized WebSocket timer
+        start_frame_synchronized_websocket_timer();
+
         setup_websocket_controllers(env::properties());
         CASPAR_LOG(info) << L"Initialized WebSocket servers.";
 
@@ -189,6 +207,13 @@ struct server::impl
     {
         std::weak_ptr<boost::asio::io_context> weak_io_context         = io_context_;
         std::weak_ptr<boost::asio::io_context> weak_monitor_io_context = monitor_io_context_;
+
+        // Stop frame-synchronized timer
+        frame_sync_active_.store(false);
+        if (frame_sync_timer_) {
+            frame_sync_timer_->cancel();
+        }
+
         io_context_.reset();
         monitor_io_context_.reset();
         predefined_osc_subscriptions_.clear();
@@ -350,79 +375,41 @@ struct server::impl
             auto default_color_space =
                 color_space_str == L"bt2020" ? core::color_space::bt2020 : core::color_space::bt709;
 
-            auto channel_prefix = std::string("channel/") + std::to_string(channel_id) + "/";
-            auto cached_paths   = std::make_shared<std::unordered_set<std::string>>();
+            // NEW ARCHITECTURE: Create dedicated monitor data for this channel
+            auto channel_monitor            = std::make_unique<channel_monitor_data>();
+            channel_monitor->channel_prefix = "channel/" + std::to_string(channel_id) + "/";
+
+            // Store reference for callback
+            auto* channel_monitor_ptr = channel_monitor.get();
+            channel_monitor_data_.push_back(std::move(channel_monitor));
 
             auto channel = spl::make_shared<video_channel>(
                 channel_id,
                 format_desc,
                 default_color_space,
                 accelerator_.create_image_mixer(channel_id, depth),
-                [this, channel_id, weak_client, cached_paths, channel_prefix](core::monitor::state channel_state) {
-                    std::unordered_set<std::string> new_paths;
+                [this, channel_id, weak_client, channel_monitor_ptr](core::monitor::state channel_state) {
+                    // NEW ARCHITECTURE: Store channel state directly without global contention
+                    {
+                        std::lock_guard<std::mutex> lock(channel_monitor_ptr->state_mutex);
 
-                    for (const auto& [path, values] : channel_state) {
-                        std::string full_path = channel_prefix + path;
-                        new_paths.insert(full_path);
-
-                        tbb::concurrent_hash_map<std::string, core::monitor::vector_t>::accessor acc;
-                        monitor_data_.insert(acc, full_path);
-                        acc->second = values;
-                    }
-
-                    for (const auto& old_path : *cached_paths) {
-                        if (new_paths.find(old_path) == new_paths.end()) {
-                            tbb::concurrent_hash_map<std::string, core::monitor::vector_t>::accessor acc;
-                            if (monitor_data_.find(acc, old_path)) {
-                                monitor_data_.erase(acc);
-                            }
+                        // Apply channel prefix to all paths
+                        core::monitor::state prefixed_state;
+                        for (const auto& [path, values] : channel_state) {
+                            std::string full_path     = channel_monitor_ptr->channel_prefix + path;
+                            prefixed_state[full_path] = values;
                         }
-                    }
 
-                    *cached_paths = std::move(new_paths);
+                        // Store the complete prefixed state for this channel
+                        channel_monitor_ptr->current_state = std::move(prefixed_state);
+                        channel_monitor_ptr->state_updated.store(true);
 
-                    // Send to websocket monitor client (lock-free)
-                    auto client_ptr = websocket_monitor_client_.load();
-                    if (client_ptr) {
-                        try {
-                            // LATENCY DEBUGGING: Record when monitor state is prepared
-                            auto                 state_prep_time = std::chrono::steady_clock::now();
-                            core::monitor::state complete_state  = get_current_monitor_state();
-
-                            // Count state entries by iterating
-                            int state_entry_count = 0;
-                            for (const auto& [path, values] : complete_state) {
-                                (void)path;   // Suppress unused variable warning
-                                (void)values; // Suppress unused variable warning
-                                state_entry_count++;
-                            }
-                            // LATENCY DEBUGGING: Log state preparation
-                            CASPAR_LOG(debug) << L"WebSocket monitor: STATE PREPARED - channel " << channel_id
-                                              << L" - state entries: " << state_entry_count;
-
-                            // CRITICAL: Post to dedicated monitor IO context to avoid blocking video thread
-                            boost::asio::post(
-                                *monitor_io_context_,
-                                [client_ptr, state = std::move(complete_state), state_prep_time]() {
-                                    try {
-                                        // LATENCY DEBUGGING: Calculate time from state prep to send
-                                        auto send_time          = std::chrono::steady_clock::now();
-                                        auto prep_to_send_delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                                      send_time - state_prep_time)
-                                                                      .count();
-                                        if (prep_to_send_delay > 10) {
-                                            CASPAR_LOG(warning)
-                                                << L"WebSocket monitor: MONITOR IO CONTEXT DELAY - delay: "
-                                                << prep_to_send_delay << L"ms";
-                                        }
-
-                                        client_ptr->send(state);
-                                    } catch (const std::exception& e) {
-                                        CASPAR_LOG(error) << L"WebSocket monitor client send error: " << u16(e.what());
-                                    }
-                                });
-                        } catch (const std::exception& e) {
-                            CASPAR_LOG(error) << L"WebSocket monitor state preparation error: " << u16(e.what());
+                        // Count channel_state entries manually since state doesn't have size()
+                        int channel_state_count = 0;
+                        for (const auto& [path, values] : channel_state) {
+                            (void)path;   // Suppress unused variable warning
+                            (void)values; // Suppress unused variable warning
+                            channel_state_count++;
                         }
                     }
 
@@ -699,35 +686,147 @@ struct server::impl
         CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid protocol: " + name));
     }
 
-    void cleanup_channel_data(int channel_id)
-    {
-        std::vector<std::string> keys_to_remove;
+    // REMOVED: cleanup_channel_data() - no longer needed with per-channel architecture
 
-        for (tbb::concurrent_hash_map<std::string, core::monitor::vector_t>::const_iterator it = monitor_data_.begin();
-             it != monitor_data_.end();
-             ++it) {
-            std::string channel_prefix = "channel/" + std::to_string(channel_id) + "/";
-            if (it->first.substr(0, channel_prefix.length()) == channel_prefix) {
-                keys_to_remove.push_back(it->first);
+    void start_frame_synchronized_websocket_timer()
+    {
+        frame_sync_timer_ = std::make_unique<boost::asio::steady_timer>(*monitor_io_context_);
+        frame_sync_active_.store(true);
+        schedule_frame_sync_update();
+    }
+
+    void schedule_frame_sync_update()
+    {
+        if (!frame_sync_timer_ || !frame_sync_active_.load())
+            return;
+
+        // Calculate frame duration based on fastest channel (assuming 60fps for now)
+        // This will be dynamically adjusted based on actual channel frame rates
+        auto frame_duration = calculate_frame_duration();
+
+        frame_sync_timer_->expires_after(frame_duration);
+        frame_sync_timer_->async_wait([this](const boost::system::error_code& ec) {
+            if (!ec && frame_sync_active_.load()) {
+                send_frame_synchronized_websocket_update();
+                schedule_frame_sync_update(); // Schedule next frame
+            }
+        });
+    }
+
+    std::chrono::microseconds calculate_frame_duration() const
+    {
+        // Find the fastest channel frame rate
+        double fastest_fps = 60.0; // Default fallback
+
+        for (const auto& channel_monitor : channel_monitor_data_) {
+            if (!channel_monitor)
+                continue;
+
+            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
+
+            // Look for framerate information in the channel state
+            for (const auto& [path, values] : channel_monitor->current_state) {
+                if (path.find("/framerate") != std::string::npos) {
+                    // Extract framerate from monitor state
+                    // This assumes framerate is stored as [numerator, denominator]
+                    if (values.size() >= 2) {
+                        // Helper function to safely extract numeric value from variant
+                        auto extract_numeric = [](const core::monitor::data_t& variant) -> double {
+                            if (auto* val = boost::get<int32_t>(&variant))
+                                return static_cast<double>(*val);
+                            if (auto* val = boost::get<int64_t>(&variant))
+                                return static_cast<double>(*val);
+                            if (auto* val = boost::get<uint32_t>(&variant))
+                                return static_cast<double>(*val);
+                            if (auto* val = boost::get<uint64_t>(&variant))
+                                return static_cast<double>(*val);
+                            if (auto* val = boost::get<float>(&variant))
+                                return static_cast<double>(*val);
+                            if (auto* val = boost::get<double>(&variant))
+                                return *val;
+                            return 0.0; // Default fallback
+                        };
+
+                        double numerator   = extract_numeric(values[0]);
+                        double denominator = extract_numeric(values[1]);
+
+                        if (denominator > 0) {
+                            double fps = numerator / denominator;
+                            if (fps > fastest_fps) {
+                                fastest_fps = fps;
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        for (const auto& key : keys_to_remove) {
-            tbb::concurrent_hash_map<std::string, core::monitor::vector_t>::accessor acc;
-            if (monitor_data_.find(acc, key)) {
-                monitor_data_.erase(acc);
+        // Convert fps to microseconds
+        auto frame_duration_us = static_cast<int64_t>(1000000.0 / fastest_fps);
+        return std::chrono::microseconds(frame_duration_us);
+    }
+
+    void send_frame_synchronized_websocket_update()
+    {
+        // Aggregate state from all channels
+        core::monitor::state complete_state;
+        int                  total_channels = 0;
+        int                  total_paths    = 0;
+
+        for (const auto& channel_monitor : channel_monitor_data_) {
+            if (!channel_monitor)
+                continue;
+
+            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
+
+            // Merge this channel's state into the complete state
+            for (const auto& [path, values] : channel_monitor->current_state) {
+                complete_state[path] = values;
+                total_paths++;
+            }
+
+            total_channels++;
+        }
+
+        // Send to WebSocket monitor client
+        auto client_ptr = websocket_monitor_client_.load();
+        if (client_ptr && total_paths > 0) {
+            try {
+                boost::asio::post(*monitor_io_context_, [client_ptr, state = std::move(complete_state)]() {
+                    try {
+                        client_ptr->send(state);
+                    } catch (const std::exception& e) {
+                        CASPAR_LOG(error) << L"WebSocket monitor client send error: " << u16(e.what());
+                    }
+                });
+            } catch (const std::exception& e) {
+                CASPAR_LOG(error) << L"WebSocket monitor frame sync error: " << u16(e.what());
             }
         }
     }
 
     core::monitor::state get_current_monitor_state() const
     {
+        // NEW ARCHITECTURE: Aggregate state from per-channel data (no global contention)
         core::monitor::state complete_state;
-        for (tbb::concurrent_hash_map<std::string, core::monitor::vector_t>::const_iterator it = monitor_data_.begin();
-             it != monitor_data_.end();
-             ++it) {
-            complete_state[it->first] = it->second;
+        int                  total_channels = 0;
+        int                  total_paths    = 0;
+
+        for (const auto& channel_monitor : channel_monitor_data_) {
+            if (!channel_monitor)
+                continue;
+
+            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
+
+            // Merge this channel's state into the complete state
+            for (const auto& [path, values] : channel_monitor->current_state) {
+                complete_state[path] = values;
+                total_paths++;
+            }
+
+            total_channels++;
         }
+
         return complete_state;
     }
 };

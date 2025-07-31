@@ -175,11 +175,6 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         auto send_attempt_time = std::chrono::steady_clock::now();
         last_send_time_        = send_attempt_time;
 
-        // LATENCY DEBUGGING: Log message size and timing
-        CASPAR_LOG(debug) << L"WebSocket monitor: SEND ATTEMPT - client " << u16(connection_id_) << L" ("
-                          << u16(client_address_) << L") - message size: " << message.length()
-                          << L" bytes, write_in_flight: " << (write_in_flight_ ? L"true" : L"false");
-
         // Post the work to the correct executor to preserve ordering
         auto weak_self = std::weak_ptr<websocket_monitor_session>(this->shared_from_this());
         net::post(ws_.get_executor(), [weak_self, msg = std::string(message), send_attempt_time]() mutable {
@@ -190,15 +185,6 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
             try {
                 if (!self->is_open_)
                     return;
-
-                // LATENCY DEBUGGING: Calculate time from send attempt to executor
-                auto executor_time = std::chrono::steady_clock::now();
-                auto executor_delay =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(executor_time - send_attempt_time).count();
-                if (executor_delay > 10) { // Log if delay is significant
-                    CASPAR_LOG(warning) << L"WebSocket monitor: EXECUTOR DELAY - client " << u16(self->connection_id_)
-                                        << L" - delay: " << executor_delay << L"ms";
-                }
 
                 // If a write is currently in flight, drop the message
                 if (self->write_in_flight_) {
@@ -250,10 +236,6 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
 
                     return;
                 }
-
-                // LATENCY DEBUGGING: Log successful send attempt
-                CASPAR_LOG(debug) << L"WebSocket monitor: SEND START - client " << u16(self->connection_id_)
-                                  << L" - message size: " << msg.length() << L" bytes";
 
                 // No write in flight – send immediately
                 self->write_in_flight_ = true;
@@ -470,7 +452,6 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         try {
             std::string message = beast::buffers_to_string(buffer_.data());
             if (!message.empty()) {
-                CASPAR_LOG(debug) << L"WebSocket monitor: Received message: " << u16(message);
                 handle_message(message);
             }
         } catch (const std::exception& e) {
@@ -531,8 +512,8 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
         // LATENCY DEBUGGING: Calculate and log write duration
         auto write_duration =
             std::chrono::duration_cast<std::chrono::milliseconds>(write_complete_time - send_attempt_time).count();
-        auto write_count    = write_count_.fetch_add(1) + 1;
-        auto total_duration = total_write_duration_ms_.fetch_add(write_duration) + write_duration;
+        write_count_.fetch_add(1);
+        total_write_duration_ms_.fetch_add(write_duration);
 
         // Update min/max tracking
         int64_t current_max = max_write_duration_ms_.load();
@@ -546,13 +527,6 @@ class websocket_monitor_session : public std::enable_shared_from_this<websocket_
                !min_write_duration_ms_.compare_exchange_weak(current_min, write_duration)) {
             // Retry if compare_exchange failed
         }
-
-        // Log detailed timing information
-        CASPAR_LOG(debug) << L"WebSocket monitor: WRITE COMPLETE - client " << u16(connection_id_) << L" ("
-                          << u16(client_address_) << L") - duration: " << write_duration << L"ms" << L", bytes: "
-                          << bytes_transferred << L", avg: " << (total_duration / write_count) << L"ms" << L", min: "
-                          << min_write_duration_ms_.load() << L"ms" << L", max: " << max_write_duration_ms_.load()
-                          << L"ms";
 
         // Log warnings for slow writes
         if (write_duration > 100) {
@@ -614,9 +588,6 @@ class websocket_monitor_listener : public std::enable_shared_from_this<websocket
     // Lock-free session tracking (no mutex needed)
     tbb::concurrent_hash_map<std::shared_ptr<websocket_monitor_session>, bool> active_sessions_;
 
-    // LATENCY DEBUGGING: Periodic stats logging
-    std::unique_ptr<boost::asio::deadline_timer> stats_timer_;
-
   public:
     websocket_monitor_listener(net::io_context&                          ioc,
                                tcp::endpoint                             endpoint,
@@ -662,21 +633,12 @@ class websocket_monitor_listener : public std::enable_shared_from_this<websocket
     {
         running_ = true;
         do_accept();
-
-        // LATENCY DEBUGGING: Start periodic stats logging
-        stats_timer_ = std::make_unique<boost::asio::deadline_timer>(ioc_);
-        schedule_stats_logging();
     }
 
     void stop()
     {
         running_ = false;
         acceptor_.close();
-
-        // LATENCY DEBUGGING: Stop stats timer
-        if (stats_timer_) {
-            stats_timer_->cancel();
-        }
 
         // Close all active sessions (lock-free)
         for (tbb::concurrent_hash_map<std::shared_ptr<websocket_monitor_session>, bool>::iterator it =
@@ -688,35 +650,6 @@ class websocket_monitor_listener : public std::enable_shared_from_this<websocket
             }
         }
         active_sessions_.clear();
-    }
-
-  private:
-    // LATENCY DEBUGGING: Schedule periodic stats logging
-    void schedule_stats_logging()
-    {
-        if (!running_ || !stats_timer_) {
-            return;
-        }
-
-        stats_timer_->expires_from_now(boost::posix_time::seconds(30)); // Log every 30 seconds
-        stats_timer_->async_wait([this](const boost::system::error_code& ec) {
-            if (!ec && running_) {
-                log_all_connection_stats();
-                schedule_stats_logging(); // Schedule next log
-            }
-        });
-    }
-
-    // LATENCY DEBUGGING: Log stats for all active connections
-    void log_all_connection_stats()
-    {
-        CASPAR_LOG(info) << L"WebSocket monitor: PERIODIC STATS - active connections: " << active_sessions_.size();
-        for (auto it = active_sessions_.begin(); it != active_sessions_.end(); ++it) {
-            auto session = it->first;
-            if (session) {
-                session->log_connection_stats();
-            }
-        }
     }
 
   private:
@@ -836,8 +769,7 @@ void websocket_monitor_session::handle_message(const std::string& message)
         nlohmann::json json_msg;
         try {
             json_msg = nlohmann::json::parse(message);
-        } catch (const nlohmann::json::exception& e) {
-            CASPAR_LOG(debug) << L"WebSocket monitor: Invalid JSON message: " << u16(e.what());
+        } catch (const nlohmann::json::exception&) {
             return;
         }
 
@@ -855,7 +787,6 @@ void websocket_monitor_session::handle_message(const std::string& message)
 
         // Log unknown messages at debug level to reduce noise
         if (!message.empty() && message != "{}" && message != "null") {
-            CASPAR_LOG(debug) << L"WebSocket monitor: Received unknown message: " << u16(message);
         }
     } catch (const std::exception& e) {
         CASPAR_LOG(error) << L"WebSocket monitor: Error handling message: " << u16(e.what());
