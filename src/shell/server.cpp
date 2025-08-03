@@ -128,19 +128,18 @@ struct server::impl
     // NEW ARCHITECTURE: Per-channel monitor data storage (eliminates global state contention)
     struct channel_monitor_data
     {
-        core::monitor::state current_state;
-        std::mutex           state_mutex;
-        std::atomic<bool>    state_updated{false};
-        std::string          channel_prefix;
+        std::array<core::monitor::state, 2> state_buffers;
+        std::atomic<int>                    active_buffer{0};
+        std::atomic<bool>                   state_updated{false};
+        std::string                         channel_prefix;
+        double                              frame_rate{60.0};
+        std::atomic<bool>                   is_fastest_channel{false};
+        std::string                         current_format;
     };
     std::vector<std::unique_ptr<channel_monitor_data>> channel_monitor_data_;
 
-    // Frame-synchronized WebSocket timer
-    std::unique_ptr<boost::asio::steady_timer> frame_sync_timer_;
-    std::atomic<uint64_t>                      last_frame_counter_{0};
-    std::atomic<bool>                          frame_sync_active_{false};
-
-    // REMOVED: Global monitor_data_ concurrent_hash_map that was causing all the contention
+    std::atomic<int>    fastest_channel_index{-1};
+    std::atomic<double> global_fastest_fps{0.0};
 
     impl(const impl&)            = delete;
     impl& operator=(const impl&) = delete;
@@ -180,11 +179,6 @@ struct server::impl
         auto xml_channels = setup_channels(env::properties());
         CASPAR_LOG(info) << L"Initialized channels.";
 
-        // NEW ARCHITECTURE: Initialize per-channel monitor data storage
-
-        // Start frame-synchronized WebSocket timer
-        start_frame_synchronized_websocket_timer();
-
         setup_websocket_controllers(env::properties());
         CASPAR_LOG(info) << L"Initialized WebSocket servers.";
 
@@ -207,12 +201,6 @@ struct server::impl
     {
         std::weak_ptr<boost::asio::io_context> weak_io_context         = io_context_;
         std::weak_ptr<boost::asio::io_context> weak_monitor_io_context = monitor_io_context_;
-
-        // Stop frame-synchronized timer
-        frame_sync_active_.store(false);
-        if (frame_sync_timer_) {
-            frame_sync_timer_->cancel();
-        }
 
         io_context_.reset();
         monitor_io_context_.reset();
@@ -375,13 +363,28 @@ struct server::impl
             auto default_color_space =
                 color_space_str == L"bt2020" ? core::color_space::bt2020 : core::color_space::bt709;
 
-            // NEW ARCHITECTURE: Create dedicated monitor data for this channel
             auto channel_monitor            = std::make_unique<channel_monitor_data>();
             channel_monitor->channel_prefix = "channel/" + std::to_string(channel_id) + "/";
+            channel_monitor->frame_rate     = format_desc.fps;
+            channel_monitor->current_format = u8(format_desc.name);
 
-            // Store reference for callback
             auto* channel_monitor_ptr = channel_monitor.get();
             channel_monitor_data_.push_back(std::move(channel_monitor));
+
+            double current_fastest = global_fastest_fps.load();
+            if (format_desc.fps > current_fastest) {
+                if (global_fastest_fps.compare_exchange_strong(current_fastest, format_desc.fps)) {
+                    int old_fastest = fastest_channel_index.exchange(channel_id - 1);
+
+                    if (old_fastest >= 0 && old_fastest < static_cast<int>(channel_monitor_data_.size())) {
+                        channel_monitor_data_[old_fastest]->is_fastest_channel.store(false);
+                    }
+
+                    channel_monitor_ptr->is_fastest_channel.store(true);
+                    CASPAR_LOG(info) << L"Channel " << channel_id << L" is initial fastest channel at "
+                                     << format_desc.fps << L" fps";
+                }
+            }
 
             auto channel = spl::make_shared<video_channel>(
                 channel_id,
@@ -389,31 +392,181 @@ struct server::impl
                 default_color_space,
                 accelerator_.create_image_mixer(channel_id, depth),
                 [this, channel_id, weak_client, channel_monitor_ptr](core::monitor::state channel_state) {
-                    // NEW ARCHITECTURE: Store channel state directly without global contention
-                    {
-                        std::lock_guard<std::mutex> lock(channel_monitor_ptr->state_mutex);
+                    bool format_changed = false;
 
-                        // Apply channel prefix to all paths
-                        core::monitor::state prefixed_state;
-                        for (const auto& [path, values] : channel_state) {
-                            std::string full_path     = channel_monitor_ptr->channel_prefix + path;
-                            prefixed_state[full_path] = values;
-                        }
+                    for (const auto& [path, values] : channel_state) {
+                        if (path == "format" && !values.empty()) {
+                            try {
+                                std::string new_format;
+                                bool        format_found = false;
 
-                        // Store the complete prefixed state for this channel
-                        channel_monitor_ptr->current_state = std::move(prefixed_state);
-                        channel_monitor_ptr->state_updated.store(true);
+                                if (const auto* str_val = boost::get<std::string>(&values[0])) {
+                                    new_format   = *str_val;
+                                    format_found = true;
+                                } else if (const auto* wstr_val = boost::get<std::wstring>(&values[0])) {
+                                    new_format   = u8(*wstr_val);
+                                    format_found = true;
+                                } else {
+                                    CASPAR_LOG(warning) << L"Unexpected format type for channel " << channel_id;
+                                    continue;
+                                }
 
-                        // Count channel_state entries manually since state doesn't have size()
-                        int channel_state_count = 0;
-                        for (const auto& [path, values] : channel_state) {
-                            (void)path;   // Suppress unused variable warning
-                            (void)values; // Suppress unused variable warning
-                            channel_state_count++;
+                                if (format_found && new_format != channel_monitor_ptr->current_format) {
+                                    format_changed                      = true;
+                                    channel_monitor_ptr->current_format = new_format;
+                                }
+                            } catch (const std::exception& e) {
+                                CASPAR_LOG(error)
+                                    << L"Error extracting format for channel " << channel_id << L": " << u16(e.what());
+
+                                // Log the actual type for debugging
+                                if (!values.empty()) {
+                                    CASPAR_LOG(debug) << L"Format value type: "
+                                                      << (boost::get<std::int32_t>(&values[0])    ? L"int32"
+                                                          : boost::get<std::int64_t>(&values[0])  ? L"int64"
+                                                          : boost::get<std::uint32_t>(&values[0]) ? L"uint32"
+                                                          : boost::get<std::uint64_t>(&values[0]) ? L"uint64"
+                                                          : boost::get<double>(&values[0])        ? L"double"
+                                                          : boost::get<float>(&values[0])         ? L"float"
+                                                          : boost::get<std::string>(&values[0])   ? L"string"
+                                                          : boost::get<std::wstring>(&values[0])  ? L"wstring"
+                                                          : boost::get<bool>(&values[0])          ? L"bool"
+                                                                                                  : L"unknown");
+                                }
+                            }
                         }
                     }
 
-                    // Send to OSC client (keep existing behavior)
+                    if (format_changed) {
+                        for (const auto& [path, values] : channel_state) {
+                            if (path == "framerate" && values.size() >= 2) {
+                                try {
+                                    int  numerator = 0, denominator = 0;
+                                    bool numerator_found = false, denominator_found = false;
+
+                                    // Try different integer types for numerator
+                                    if (const auto* i32_val = boost::get<std::int32_t>(&values[0])) {
+                                        numerator       = *i32_val;
+                                        numerator_found = true;
+                                    } else if (const auto* i64_val = boost::get<std::int64_t>(&values[0])) {
+                                        numerator       = static_cast<int>(*i64_val);
+                                        numerator_found = true;
+                                    } else if (const auto* ui32_val = boost::get<std::uint32_t>(&values[0])) {
+                                        numerator       = static_cast<int>(*ui32_val);
+                                        numerator_found = true;
+                                    } else if (const auto* ui64_val = boost::get<std::uint64_t>(&values[0])) {
+                                        numerator       = static_cast<int>(*ui64_val);
+                                        numerator_found = true;
+                                    } else if (const auto* dbl_val = boost::get<double>(&values[0])) {
+                                        numerator       = static_cast<int>(*dbl_val);
+                                        numerator_found = true;
+                                    } else if (const auto* flt_val = boost::get<float>(&values[0])) {
+                                        numerator       = static_cast<int>(*flt_val);
+                                        numerator_found = true;
+                                    }
+
+                                    // Try different integer types for denominator
+                                    if (const auto* i32_val = boost::get<std::int32_t>(&values[1])) {
+                                        denominator       = *i32_val;
+                                        denominator_found = true;
+                                    } else if (const auto* i64_val = boost::get<std::int64_t>(&values[1])) {
+                                        denominator       = static_cast<int>(*i64_val);
+                                        denominator_found = true;
+                                    } else if (const auto* ui32_val = boost::get<std::uint32_t>(&values[1])) {
+                                        denominator       = static_cast<int>(*ui32_val);
+                                        denominator_found = true;
+                                    } else if (const auto* ui64_val = boost::get<std::uint64_t>(&values[1])) {
+                                        denominator       = static_cast<int>(*ui64_val);
+                                        denominator_found = true;
+                                    } else if (const auto* dbl_val = boost::get<double>(&values[1])) {
+                                        denominator       = static_cast<int>(*dbl_val);
+                                        denominator_found = true;
+                                    } else if (const auto* flt_val = boost::get<float>(&values[1])) {
+                                        denominator       = static_cast<int>(*flt_val);
+                                        denominator_found = true;
+                                    }
+
+                                    if (numerator_found && denominator_found && denominator > 0) {
+                                        double new_fps                  = static_cast<double>(numerator) / denominator;
+                                        channel_monitor_ptr->frame_rate = new_fps;
+                                        CASPAR_LOG(info)
+                                            << L"Channel " << channel_id << L" framerate: " << new_fps << L" fps";
+
+                                        double current_fastest = global_fastest_fps.load();
+                                        if (new_fps > current_fastest) {
+                                            if (global_fastest_fps.compare_exchange_strong(current_fastest, new_fps)) {
+                                                int old_fastest = fastest_channel_index.exchange(channel_id - 1);
+
+                                                if (old_fastest >= 0 &&
+                                                    old_fastest < static_cast<int>(channel_monitor_data_.size())) {
+                                                    channel_monitor_data_[old_fastest]->is_fastest_channel.store(false);
+                                                }
+
+                                                channel_monitor_ptr->is_fastest_channel.store(true);
+                                                CASPAR_LOG(info)
+                                                    << L"Channel " << channel_id << L" is now fastest channel at "
+                                                    << new_fps << L" fps";
+                                            }
+                                        } else if (channel_monitor_ptr->is_fastest_channel.load()) {
+                                            channel_monitor_ptr->is_fastest_channel.store(false);
+                                            recalculate_fastest_channel();
+                                        }
+                                    } else {
+                                        CASPAR_LOG(warning)
+                                            << L"Could not extract valid framerate values for channel " << channel_id;
+                                    }
+                                } catch (const std::exception& e) {
+                                    CASPAR_LOG(error) << L"Error extracting framerate for channel " << channel_id
+                                                      << L": " << u16(e.what());
+
+                                    // Log the actual types for debugging
+                                    if (values.size() >= 2) {
+                                        CASPAR_LOG(debug) << L"Framerate values types - [0]: "
+                                                          << (boost::get<std::int32_t>(&values[0])    ? L"int32"
+                                                              : boost::get<std::int64_t>(&values[0])  ? L"int64"
+                                                              : boost::get<std::uint32_t>(&values[0]) ? L"uint32"
+                                                              : boost::get<std::uint64_t>(&values[0]) ? L"uint64"
+                                                              : boost::get<double>(&values[0])        ? L"double"
+                                                              : boost::get<float>(&values[0])         ? L"float"
+                                                              : boost::get<std::string>(&values[0])   ? L"string"
+                                                              : boost::get<std::wstring>(&values[0])  ? L"wstring"
+                                                              : boost::get<bool>(&values[0])          ? L"bool"
+                                                                                                      : L"unknown")
+                                                          << L", [1]: "
+                                                          << (boost::get<std::int32_t>(&values[1])    ? L"int32"
+                                                              : boost::get<std::int64_t>(&values[1])  ? L"int64"
+                                                              : boost::get<std::uint32_t>(&values[1]) ? L"uint32"
+                                                              : boost::get<std::uint64_t>(&values[1]) ? L"uint64"
+                                                              : boost::get<double>(&values[1])        ? L"double"
+                                                              : boost::get<float>(&values[1])         ? L"float"
+                                                              : boost::get<std::string>(&values[1])   ? L"string"
+                                                              : boost::get<std::wstring>(&values[1])  ? L"wstring"
+                                                              : boost::get<bool>(&values[1])          ? L"bool"
+                                                                                                      : L"unknown");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    core::monitor::state prefixed_state;
+                    for (const auto& [path, values] : channel_state) {
+                        std::string full_path     = channel_monitor_ptr->channel_prefix + path;
+                        prefixed_state[full_path] = values;
+                    }
+
+                    int current_buffer = channel_monitor_ptr->active_buffer.load();
+                    int next_buffer    = 1 - current_buffer;
+
+                    channel_monitor_ptr->state_buffers[next_buffer] = std::move(prefixed_state);
+                    channel_monitor_ptr->active_buffer.store(next_buffer);
+                    channel_monitor_ptr->state_updated.store(true);
+
+                    if (channel_monitor_ptr->is_fastest_channel.load()) {
+                        boost::asio::post(*monitor_io_context_,
+                                          [this]() { send_frame_synchronized_websocket_update(); });
+                    }
+
                     auto client = weak_client.lock();
                     if (client) {
                         monitor::state osc_state;
@@ -686,89 +839,8 @@ struct server::impl
         CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid protocol: " + name));
     }
 
-    // REMOVED: cleanup_channel_data() - no longer needed with per-channel architecture
-
-    void start_frame_synchronized_websocket_timer()
-    {
-        frame_sync_timer_ = std::make_unique<boost::asio::steady_timer>(*monitor_io_context_);
-        frame_sync_active_.store(true);
-        schedule_frame_sync_update();
-    }
-
-    void schedule_frame_sync_update()
-    {
-        if (!frame_sync_timer_ || !frame_sync_active_.load())
-            return;
-
-        // Calculate frame duration based on fastest channel (assuming 60fps for now)
-        // This will be dynamically adjusted based on actual channel frame rates
-        auto frame_duration = calculate_frame_duration();
-
-        frame_sync_timer_->expires_after(frame_duration);
-        frame_sync_timer_->async_wait([this](const boost::system::error_code& ec) {
-            if (!ec && frame_sync_active_.load()) {
-                send_frame_synchronized_websocket_update();
-                schedule_frame_sync_update(); // Schedule next frame
-            }
-        });
-    }
-
-    std::chrono::microseconds calculate_frame_duration() const
-    {
-        // Find the fastest channel frame rate
-        double fastest_fps = 60.0; // Default fallback
-
-        for (const auto& channel_monitor : channel_monitor_data_) {
-            if (!channel_monitor)
-                continue;
-
-            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
-
-            // Look for framerate information in the channel state
-            for (const auto& [path, values] : channel_monitor->current_state) {
-                if (path.find("/framerate") != std::string::npos) {
-                    // Extract framerate from monitor state
-                    // This assumes framerate is stored as [numerator, denominator]
-                    if (values.size() >= 2) {
-                        // Helper function to safely extract numeric value from variant
-                        auto extract_numeric = [](const core::monitor::data_t& variant) -> double {
-                            if (auto* val = boost::get<int32_t>(&variant))
-                                return static_cast<double>(*val);
-                            if (auto* val = boost::get<int64_t>(&variant))
-                                return static_cast<double>(*val);
-                            if (auto* val = boost::get<uint32_t>(&variant))
-                                return static_cast<double>(*val);
-                            if (auto* val = boost::get<uint64_t>(&variant))
-                                return static_cast<double>(*val);
-                            if (auto* val = boost::get<float>(&variant))
-                                return static_cast<double>(*val);
-                            if (auto* val = boost::get<double>(&variant))
-                                return *val;
-                            return 0.0; // Default fallback
-                        };
-
-                        double numerator   = extract_numeric(values[0]);
-                        double denominator = extract_numeric(values[1]);
-
-                        if (denominator > 0) {
-                            double fps = numerator / denominator;
-                            if (fps > fastest_fps) {
-                                fastest_fps = fps;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Convert fps to microseconds
-        auto frame_duration_us = static_cast<int64_t>(1000000.0 / fastest_fps);
-        return std::chrono::microseconds(frame_duration_us);
-    }
-
     void send_frame_synchronized_websocket_update()
     {
-        // Aggregate state from all channels
         core::monitor::state complete_state;
         int                  total_channels = 0;
         int                  total_paths    = 0;
@@ -777,10 +849,10 @@ struct server::impl
             if (!channel_monitor)
                 continue;
 
-            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
+            int         active_buffer = channel_monitor->active_buffer.load();
+            const auto& current_state = channel_monitor->state_buffers[active_buffer];
 
-            // Merge this channel's state into the complete state
-            for (const auto& [path, values] : channel_monitor->current_state) {
+            for (const auto& [path, values] : current_state) {
                 complete_state[path] = values;
                 total_paths++;
             }
@@ -788,26 +860,40 @@ struct server::impl
             total_channels++;
         }
 
-        // Send to WebSocket monitor client
         auto client_ptr = websocket_monitor_client_.load();
         if (client_ptr && total_paths > 0) {
             try {
-                boost::asio::post(*monitor_io_context_, [client_ptr, state = std::move(complete_state)]() {
-                    try {
-                        client_ptr->send(state);
-                    } catch (const std::exception& e) {
-                        CASPAR_LOG(error) << L"WebSocket monitor client send error: " << u16(e.what());
-                    }
-                });
+                client_ptr->send(complete_state);
             } catch (const std::exception& e) {
-                CASPAR_LOG(error) << L"WebSocket monitor frame sync error: " << u16(e.what());
+                CASPAR_LOG(error) << L"WebSocket monitor client send error: " << u16(e.what());
+            }
+        }
+    }
+
+    void recalculate_fastest_channel()
+    {
+        double fastest_fps   = 0.0;
+        int    fastest_index = -1;
+
+        for (size_t i = 0; i < channel_monitor_data_.size(); ++i) {
+            if (channel_monitor_data_[i] && channel_monitor_data_[i]->frame_rate > fastest_fps) {
+                fastest_fps   = channel_monitor_data_[i]->frame_rate;
+                fastest_index = static_cast<int>(i);
+            }
+        }
+
+        global_fastest_fps.store(fastest_fps);
+        fastest_channel_index.store(fastest_index);
+
+        for (size_t i = 0; i < channel_monitor_data_.size(); ++i) {
+            if (channel_monitor_data_[i]) {
+                channel_monitor_data_[i]->is_fastest_channel.store(i == static_cast<size_t>(fastest_index));
             }
         }
     }
 
     core::monitor::state get_current_monitor_state() const
     {
-        // NEW ARCHITECTURE: Aggregate state from per-channel data (no global contention)
         core::monitor::state complete_state;
         int                  total_channels = 0;
         int                  total_paths    = 0;
@@ -816,10 +902,10 @@ struct server::impl
             if (!channel_monitor)
                 continue;
 
-            std::lock_guard<std::mutex> lock(channel_monitor->state_mutex);
+            int         active_buffer = channel_monitor->active_buffer.load();
+            const auto& current_state = channel_monitor->state_buffers[active_buffer];
 
-            // Merge this channel's state into the complete state
-            for (const auto& [path, values] : channel_monitor->current_state) {
+            for (const auto& [path, values] : current_state) {
                 complete_state[path] = values;
                 total_paths++;
             }
