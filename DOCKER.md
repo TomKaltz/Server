@@ -6,6 +6,8 @@ This document provides instructions for building and running CasparCG Server in 
 
 CasparCG Server is a professional broadcast graphics and video playout server that communicates via the **AMCP (Advanced Media Control Protocol)** on ports 5250-5252. It's designed to run headless in production environments with full OpenGL acceleration for video mixing and graphics rendering.
 
+**This Dockerfile is based on the existing working Docker configuration** from `tools/linux/Dockerfile` but optimized for Coolify deployment with proper headless OpenGL support.
+
 ## Prerequisites
 
 - Docker 20.10+ with BuildKit enabled
@@ -21,12 +23,15 @@ This Dockerfile is designed for Coolify deployment. Simply:
 
 1. **Build the image:**
    ```bash
+   ./build.sh
+   # or manually:
    docker build -t casparcg-server .
    ```
 
 2. **Deploy to Coolify** with the following configuration:
    - **Ports**: 5250, 5251, 5252
-   - **Environment**: Headless OpenGL with EGL support
+   - **Environment**: Headless OpenGL with NVIDIA GPU support
+   - **Privileged Mode**: Enable for GPU access
    - **GPU Access**: Enable if available on host
 
 ### Using Docker directly
