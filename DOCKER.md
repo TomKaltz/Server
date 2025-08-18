@@ -232,6 +232,11 @@ The container supports several volume mounts:
    - Check network connectivity
    - Verify CMake download mirrors
 
+3. **Runtime library errors (e.g., "libatk-1.0.so.0 not found"):**
+   - This has been fixed in the current Dockerfile
+   - The image now includes all required GTK/ATK and X11 libraries
+   - Container includes `procps` for process monitoring in healthchecks
+
 ## Security Considerations
 
 - The container runs as non-root user `casparcg`

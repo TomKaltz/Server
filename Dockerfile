@@ -65,6 +65,29 @@ RUN apt-get update && apt-get install -yq --no-install-recommends \
     mesa-utils \
     mesa-va-drivers \
     mesa-vdpau-drivers \
+    # GTK/ATK libraries (required by CasparCG)
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgdk-pixbuf2.0-0 \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    # Additional X11 libraries for headless operation
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxtst6 \
+    libxi6 \
+    libxrandr2 \
+    libxss1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxfixes3 \
+    libasound2 \
+    # Process utilities for healthcheck
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy CasparCG Server from build stage
