@@ -86,8 +86,9 @@ RUN apt-get update && apt-get install -yq --no-install-recommends \
     libxdamage1 \
     libxfixes3 \
     libasound2 \
-    # Process utilities for healthcheck
+    # Process and network utilities for healthcheck
     procps \
+    net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy CasparCG Server from build stage
@@ -113,9 +114,9 @@ EXPOSE 5252
 # Copy the run script for headless operation
 COPY tools/linux/run_docker.sh ./run_docker.sh
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep casparcg || exit 1
+# Health check - check if CasparCG is listening on AMCP port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD netstat -ln | grep :5250 || exit 1
 
 # Default command - use direct binary for headless operation
 CMD ["./bin/casparcg"]

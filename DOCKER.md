@@ -233,9 +233,18 @@ The container supports several volume mounts:
    - Verify CMake download mirrors
 
 3. **Runtime library errors (e.g., "libatk-1.0.so.0 not found"):**
-   - This has been fixed in the current Dockerfile
+   - ✅ **FIXED** in the current Dockerfile
    - The image now includes all required GTK/ATK and X11 libraries
-   - Container includes `procps` for process monitoring in healthchecks
+   - Container includes `procps` and `net-tools` for healthchecks
+
+4. **Healthcheck failures:**
+   - ✅ **FIXED** - Now checks if CasparCG is listening on port 5250
+   - Uses `netstat` instead of process checking for more reliable health monitoring
+
+5. **D-Bus and X11 warnings in logs:**
+   - These are **normal and expected** in headless containerized environments
+   - CasparCG still functions perfectly without D-Bus or X11 display
+   - CEF (HTML producer) automatically uses headless mode
 
 ## Security Considerations
 
