@@ -94,6 +94,9 @@ RUN apt-get update && apt-get install -yq --no-install-recommends \
 # Copy CasparCG Server from build stage
 COPY --from=build-casparcg /staging /opt/casparcg
 
+# Copy updated configuration for external network access
+COPY src/shell/casparcg.config /opt/casparcg/casparcg.config
+
 # Set working directory
 WORKDIR /opt/casparcg
 

@@ -10,6 +10,8 @@ CasparCG Server is a professional broadcast graphics and video playout server th
 
 **Multi-Platform Support**: This Dockerfile works on both ARM64 (Apple Silicon) and AMD64 (Intel/AMD) architectures, making it perfect for Coolify deployments on any platform.
 
+**Network Configuration**: The server is configured to bind to all network interfaces (`0.0.0.0`) making it accessible from external networks including ZeroTier, VPNs, and remote connections.
+
 ## Prerequisites
 
 - Docker 20.10+ with BuildKit enabled
