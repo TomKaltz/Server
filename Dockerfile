@@ -44,19 +44,28 @@ RUN cmake --install . --prefix staging
 RUN ln -s /build/staging /staging && \
     /source/shell/copy_deps.sh /staging/bin/casparcg /staging/lib
 
-# Runtime stage - use NVIDIA OpenGL base for proper GPU support
-FROM docker.io/nvidia/opengl:1.2-glvnd-devel-ubuntu22.04 AS runtime
+# Runtime stage - use Ubuntu base with OpenGL support for multi-platform compatibility
+FROM ubuntu:22.04 AS runtime
 
-# Install minimal runtime dependencies
-RUN set -ex; \
-    apt-get update; \
-    DEBIAN_FRONTEND="noninteractive" apt-get install -y --no-install-recommends \
-        tzdata \
-        libc++1 \
-        libnss3 \
-        fontconfig \
-        ; \
-    rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies including OpenGL support
+RUN apt-get update && apt-get install -yq --no-install-recommends \
+    tzdata \
+    libc++1 \
+    libnss3 \
+    fontconfig \
+    # OpenGL and graphics libraries for headless operation
+    libgl1-mesa-glx \
+    libgl1-mesa-dri \
+    libglu1-mesa \
+    libegl1-mesa \
+    libgles2-mesa \
+    libdrm2 \
+    libgbm1 \
+    # Mesa OpenGL drivers
+    mesa-utils \
+    mesa-va-drivers \
+    mesa-vdpau-drivers \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy CasparCG Server from build stage
 COPY --from=build-casparcg /staging /opt/casparcg

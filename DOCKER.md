@@ -8,6 +8,8 @@ CasparCG Server is a professional broadcast graphics and video playout server th
 
 **This Dockerfile is based on the existing working Docker configuration** from `tools/linux/Dockerfile` but optimized for Coolify deployment with proper headless OpenGL support.
 
+**Multi-Platform Support**: This Dockerfile works on both ARM64 (Apple Silicon) and AMD64 (Intel/AMD) architectures, making it perfect for Coolify deployments on any platform.
+
 ## Prerequisites
 
 - Docker 20.10+ with BuildKit enabled
@@ -30,9 +32,9 @@ This Dockerfile is designed for Coolify deployment. Simply:
 
 2. **Deploy to Coolify** with the following configuration:
    - **Ports**: 5250, 5251, 5252
-   - **Environment**: Headless OpenGL with NVIDIA GPU support
-   - **Privileged Mode**: Enable for GPU access
-   - **GPU Access**: Enable if available on host
+   - **Environment**: Headless OpenGL with Mesa GPU support
+   - **Privileged Mode**: Enable for GPU access (optional)
+   - **Architecture**: Works on both ARM64 and AMD64
 
 ### Using Docker directly
 
