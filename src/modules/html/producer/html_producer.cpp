@@ -49,6 +49,7 @@
 #include <tbb/parallel_for.h>
 
 #include <mutex>
+#include <algorithm>
 
 #pragma warning(push)
 #pragma warning(disable : 4458)
@@ -64,6 +65,46 @@
 #include "../util.h"
 
 namespace caspar { namespace html {
+
+// Safe logging function that handles encoding issues gracefully
+void safe_log(boost::log::trivial::severity_level level, const std::wstring& prefix, const std::wstring& message)
+{
+    try {
+        // Sanitize the message by replacing non-printable characters
+        std::wstring sanitized_message = message;
+        std::replace_if(sanitized_message.begin(), sanitized_message.end(),
+            [](wchar_t c) -> bool {
+                // Keep printable characters, newlines, tabs, and common whitespace
+                return (c < 32 && c != '\n' && c != '\r' && c != '\t') || c > 126;
+            }, L'?');
+        
+        switch (level) {
+            case boost::log::trivial::debug:
+                CASPAR_LOG(debug) << prefix << L" Log: " << sanitized_message;
+                break;
+            case boost::log::trivial::warning:
+                CASPAR_LOG(warning) << prefix << L" Log: " << sanitized_message;
+                break;
+            case boost::log::trivial::error:
+                CASPAR_LOG(error) << prefix << L" Log: " << sanitized_message;
+                break;
+            case boost::log::trivial::fatal:
+                CASPAR_LOG(fatal) << prefix << L" Log: " << sanitized_message;
+                break;
+            default:
+                CASPAR_LOG(info) << prefix << L" Log: " << sanitized_message;
+                break;
+        }
+    } catch (...) {
+        // If logging fails, try to log a safe fallback message
+        try {
+            CASPAR_LOG(warning) << prefix << L" Log: [Message logging failed due to encoding issues]";
+        } catch (...) {
+            // If even the fallback fails, we can't do much more
+            // The application should continue running
+        }
+    }
+}
 
 class html_client
     : public CefClient
@@ -119,7 +160,13 @@ class html_client
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            state_["file/path"] = u8(url_);
+            try {
+                // Safely convert URL to UTF-8
+                state_["file/path"] = u8(url_);
+            } catch (...) {
+                // If URL conversion fails, use a safe fallback
+                state_["file/path"] = "[encoding_error]";
+            }
         }
 
         loaded_  = false;
@@ -341,15 +388,15 @@ class html_client
                           int                   line) override
     {
         if (level == cef_log_severity_t::LOGSEVERITY_DEBUG)
-            CASPAR_LOG(debug) << print() << L" Log: " << message.ToWString();
+            safe_log(boost::log::trivial::debug, print(), message.ToWString());
         else if (level == cef_log_severity_t::LOGSEVERITY_WARNING)
-            CASPAR_LOG(warning) << print() << L" Log: " << message.ToWString();
+            safe_log(boost::log::trivial::warning, print(), message.ToWString());
         else if (level == cef_log_severity_t::LOGSEVERITY_ERROR)
-            CASPAR_LOG(error) << print() << L" Log: " << message.ToWString();
+            safe_log(boost::log::trivial::error, print(), message.ToWString());
         else if (level == cef_log_severity_t::LOGSEVERITY_FATAL)
-            CASPAR_LOG(fatal) << print() << L" Log: " << message.ToWString();
+            safe_log(boost::log::trivial::fatal, print(), message.ToWString());
         else
-            CASPAR_LOG(info) << print() << L" Log: " << message.ToWString();
+            safe_log(boost::log::trivial::info, print(), message.ToWString());
         return true;
     }
 
@@ -395,7 +442,7 @@ class html_client
             auto severity = static_cast<boost::log::trivial::severity_level>(args->GetInt(0));
             auto msg      = args->GetString(1).ToWString();
 
-            BOOST_LOG_SEV(log::logger::get(), severity) << print() << L" [renderer_process] " << msg;
+            safe_log(severity, print(), msg);
         }
 
         return false;
@@ -404,9 +451,27 @@ class html_client
     void do_execute_javascript(const std::wstring& javascript)
     {
         html::begin_invoke([=] {
-            if (browser_ != nullptr)
-                browser_->GetMainFrame()->ExecuteJavaScript(
-                    u8(javascript).c_str(), browser_->GetMainFrame()->GetURL(), 0);
+            if (browser_ != nullptr) {
+                try {
+                    // Sanitize the JavaScript string to prevent encoding issues
+                    std::wstring sanitized_javascript = javascript;
+                    std::replace_if(sanitized_javascript.begin(), sanitized_javascript.end(),
+                        [](wchar_t c) -> bool {
+                            // Keep printable characters, newlines, tabs, and common whitespace
+                            return (c < 32 && c != '\n' && c != '\r' && c != '\t') || c > 126;
+                        }, L'?');
+                    
+                    browser_->GetMainFrame()->ExecuteJavaScript(
+                        u8(sanitized_javascript).c_str(), browser_->GetMainFrame()->GetURL(), 0);
+                } catch (...) {
+                    // If JavaScript execution fails, try to log the error safely
+                    try {
+                        safe_log(boost::log::trivial::error, print(), L"Failed to execute JavaScript due to encoding issues");
+                    } catch (...) {
+                        // If even error logging fails, we can't do much more
+                    }
+                }
+            }
         });
     }
 
@@ -420,8 +485,22 @@ class html_client
 
     std::wstring print() const
     {
-        return L"html[" + url_ + L"]" + L" " + std::to_wstring(format_desc_.square_width) + L" " +
-               std::to_wstring(format_desc_.square_height) + L" " + std::to_wstring(format_desc_.fps);
+        try {
+            // Sanitize the URL to prevent encoding issues
+            std::wstring sanitized_url = url_;
+            std::replace_if(sanitized_url.begin(), sanitized_url.end(),
+                [](wchar_t c) -> bool {
+                    // Keep printable characters, newlines, tabs, and common whitespace
+                    return (c < 32 && c != '\n' && c != '\r' && c != '\t') || c > 126;
+                }, L'?');
+            
+            return L"html[" + sanitized_url + L"]" + L" " + std::to_wstring(format_desc_.square_width) + L" " +
+                   std::to_wstring(format_desc_.square_height) + L" " + std::to_wstring(format_desc_.fps);
+        } catch (...) {
+            // If URL processing fails, return a safe fallback
+            return L"html[encoding_error] " + std::to_wstring(format_desc_.square_width) + L" " +
+                   std::to_wstring(format_desc_.square_height) + L" " + std::to_wstring(format_desc_.fps);
+        }
     }
 
     IMPLEMENT_REFCOUNTING(html_client);
@@ -514,7 +593,23 @@ class html_producer : public core::frame_producer
         return make_ready_future(std::wstring());
     }
 
-    std::wstring print() const override { return L"html[" + url_ + L"]"; }
+    std::wstring print() const override 
+    { 
+        try {
+            // Sanitize the URL to prevent encoding issues
+            std::wstring sanitized_url = url_;
+            std::replace_if(sanitized_url.begin(), sanitized_url.end(),
+                [](wchar_t c) -> bool {
+                    // Keep printable characters, newlines, tabs, and common whitespace
+                    return (c < 32 && c != '\n' && c != '\r' && c != '\t') || c > 126;
+                }, L'?');
+            
+            return L"html[" + sanitized_url + L"]";
+        } catch (...) {
+            // If URL processing fails, return a safe fallback
+            return L"html[encoding_error]";
+        }
+    }
 
     core::monitor::state state() const override
     {
@@ -545,15 +640,24 @@ spl::shared_ptr<core::frame_producer> create_cg_producer(const core::frame_produ
     std::optional<int> width;
     std::optional<int> height;
     {
-        auto u8_url = u8(url);
-
-        boost::smatch what;
-        if (boost::regex_search(u8_url, what, boost::regex("width=([0-9]+)"))) {
-            width = std::stoi(what[1].str());
+        std::string u8_url;
+        try {
+            // Safely convert URL to UTF-8
+            u8_url = u8(url);
+        } catch (...) {
+            // If URL conversion fails, skip width/height extraction
+            u8_url = "";
         }
 
-        if (boost::regex_search(u8_url, what, boost::regex("height=([0-9]+)"))) {
-            height = std::stoi(what[1].str());
+        if (!u8_url.empty()) {
+            boost::smatch what;
+            if (boost::regex_search(u8_url, what, boost::regex("width=([0-9]+)"))) {
+                width = std::stoi(what[1].str());
+            }
+
+            if (boost::regex_search(u8_url, what, boost::regex("height=([0-9]+)"))) {
+                height = std::stoi(what[1].str());
+            }
         }
     }
 

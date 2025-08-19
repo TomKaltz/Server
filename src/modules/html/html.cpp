@@ -38,6 +38,7 @@
 
 #include <memory>
 #include <utility>
+#include <algorithm>
 
 #pragma warning(push)
 #pragma warning(disable : 4458)
@@ -54,13 +55,38 @@ void caspar_log(const CefRefPtr<CefBrowser>&        browser,
                 const std::string&                  message)
 {
     if (browser != nullptr) {
-        auto msg = CefProcessMessage::Create(LOG_MESSAGE_NAME);
-        msg->GetArgumentList()->SetInt(0, level);
-        msg->GetArgumentList()->SetString(1, message);
+        try {
+            // Sanitize the message to prevent encoding issues
+            std::string sanitized_message = message;
+            std::replace_if(sanitized_message.begin(), sanitized_message.end(),
+                [](char c) -> bool {
+                    // Keep printable characters, newlines, tabs, and common whitespace
+                    return (c < 32 && c != '\n' && c != '\r' && c != '\t') || c > 126;
+                }, '?');
+            
+            auto msg = CefProcessMessage::Create(LOG_MESSAGE_NAME);
+            msg->GetArgumentList()->SetInt(0, level);
+            msg->GetArgumentList()->SetString(1, sanitized_message);
 
-        CefRefPtr<CefFrame> mainFrame = browser->GetMainFrame();
-        if (mainFrame) {
-            mainFrame->SendProcessMessage(PID_BROWSER, msg);
+            CefRefPtr<CefFrame> mainFrame = browser->GetMainFrame();
+            if (mainFrame) {
+                mainFrame->SendProcessMessage(PID_BROWSER, msg);
+            }
+        } catch (...) {
+            // If message processing fails, try to send a safe fallback message
+            try {
+                auto msg = CefProcessMessage::Create(LOG_MESSAGE_NAME);
+                msg->GetArgumentList()->SetInt(0, level);
+                msg->GetArgumentList()->SetString(1, "[Message logging failed due to encoding issues]");
+
+                CefRefPtr<CefFrame> mainFrame = browser->GetMainFrame();
+                if (mainFrame) {
+                    mainFrame->SendProcessMessage(PID_BROWSER, msg);
+                }
+            } catch (...) {
+                // If even the fallback fails, we can't do much more
+                // The application should continue running
+            }
         }
     }
 }
