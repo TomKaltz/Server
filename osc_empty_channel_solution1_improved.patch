@@ -1,0 +1,56 @@
+--- a/src/core/producer/stage.cpp
++++ b/src/core/producer/stage.cpp
+@@ -50,6 +50,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+     monitor::state                      state_;
+     std::map<int, layer>                layers_;
+     std::map<int, tweened_transform>    tweens_;
++    std::set<int>                       pending_clear_layers_;
+     std::set<int>                       routeSources;
+ 
+     mutable std::mutex      format_desc_mutex_;
+@@ -217,6 +218,17 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+                 monitor::state state;
+                 for (auto& p : layers_) {
+                     state["layer"][p.first] = p.second.state();
++                    
++                    // If this layer is pending clear, stop it to show empty state
++                    if (pending_clear_layers_.count(p.first)) {
++                        p.second.stop(); // This sets foreground to frame_producer::empty()
++                        state["layer"][p.first] = p.second.state(); // Update with empty state
++                    }
++                }
++                
++                // Remove layers that were pending clear (after their empty state was captured)
++                for (int layer_index : pending_clear_layers_) {
++                    layers_.erase(layer_index);
+                 }
++                pending_clear_layers_.clear();
+                 state_ = std::move(state);
+             } catch (...) {
+@@ -320,7 +332,12 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+ 
+     std::future<void> clear(int index)
+     {
+-        return executor_.begin_invoke([=] { layers_.erase(index); });
++        return executor_.begin_invoke([=] {
++            if (layers_.find(index) != layers_.end()) {
++                // Mark for clearing - will be processed in next frame cycle
++                pending_clear_layers_.insert(index);
++            }
++        });
+     }
+ 
+     std::future<void> clear()
+@@ -346,6 +363,11 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+     std::future<void> clear()
+     {
+-        return executor_.begin_invoke([=] { layers_.clear(); });
++        return executor_.begin_invoke([=] {
++            // Mark all layers for clearing
++            for (auto& p : layers_) {
++                pending_clear_layers_.insert(p.first);
++            }
++        });
+     }
+ 
+     std::future<void> swap_layers(const std::shared_ptr<stage>& other, bool swap_transforms)

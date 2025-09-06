@@ -1,0 +1,101 @@
+--- a/src/core/producer/stage.h
++++ b/src/core/producer/stage.h
+@@ -107,7 +107,8 @@ class stage final : public stage_base
+   public:
+     explicit stage(int                                         channel_index,
+                    spl::shared_ptr<caspar::diagnostics::graph> graph,
+-                   const core::video_format_desc&              format_desc);
++                   const core::video_format_desc&              format_desc,
++                   std::function<void(core::monitor::state)>   osc_tick = nullptr);
+ 
+     const stage_frames operator()(uint64_t                                     frame_number,
+                                   std::vector<int>&                            fetch_background,
+--- a/src/core/producer/stage.cpp
++++ b/src/core/producer/stage.cpp
+@@ -47,11 +47,13 @@ namespace caspar { namespace core {
+ struct stage::impl : public std::enable_shared_from_this<impl>
+ {
+     int                                 channel_index_;
+     spl::shared_ptr<diagnostics::graph> graph_;
+     monitor::state                      state_;
+     std::map<int, layer>                layers_;
+     std::map<int, tweened_transform>    tweens_;
+     std::set<int>                       routeSources;
++    
++    std::function<void(core::monitor::state)> osc_tick_;
+ 
+     mutable std::mutex      format_desc_mutex_;
+     core::video_format_desc format_desc_;
+@@ -110,10 +112,12 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+     }
+ 
+   public:
+-    impl(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc)
++    impl(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc, std::function<void(core::monitor::state)> osc_tick)
+         : channel_index_(channel_index)
+         , graph_(std::move(graph))
+         , format_desc_(format_desc)
++        , osc_tick_(std::move(osc_tick))
+     {
+     }
+ 
+@@ -320,7 +324,17 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+ 
+     std::future<void> clear(int index)
+     {
+-        return executor_.begin_invoke([=] { layers_.erase(index); });
++        return executor_.begin_invoke([=] {
++            // Send immediate "cleared" OSC message if layer exists
++            if (layers_.find(index) != layers_.end() && osc_tick_) {
++                monitor::state cleared_state;
++                cleared_state["stage"]["layer"][index]["status"] = "cleared";
++                cleared_state["stage"]["layer"][index]["foreground"]["producer"] = "cleared";
++                osc_tick_(cleared_state);
++            }
++            
++            layers_.erase(index);
++        });
+     }
+ 
+     std::future<void> clear()
+@@ -346,7 +360,19 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+     std::future<void> clear()
+     {
+-        return executor_.begin_invoke([=] { layers_.clear(); });
++        return executor_.begin_invoke([=] {
++            // Send "cleared" message for all existing layers
++            if (!layers_.empty() && osc_tick_) {
++                monitor::state cleared_state;
++                for (auto& p : layers_) {
++                    cleared_state["stage"]["layer"][p.first]["status"] = "cleared";
++                    cleared_state["stage"]["layer"][p.first]["foreground"]["producer"] = "cleared";
++                }
++                osc_tick_(cleared_state);
++            }
++            
++            layers_.clear();
++        });
+     }
+ 
+     std::future<void> swap_layers(const std::shared_ptr<stage>& other, bool swap_transforms)
+@@ -420,8 +446,8 @@ struct stage::impl : public std::enable_shared_from_this<impl>
+ };
+ 
+-stage::stage(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc)
+-    : impl_(new impl(channel_index, std::move(graph), format_desc))
++stage::stage(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc, std::function<void(core::monitor::state)> osc_tick)
++    : impl_(new impl(channel_index, std::move(graph), format_desc, std::move(osc_tick)))
+ {
+ }
+ std::future<std::wstring> stage::call(int index, const std::vector<std::wstring>& params)
+--- a/src/core/video_channel.cpp
++++ b/src/core/video_channel.cpp
+@@ -105,7 +105,7 @@ struct video_channel::impl final
+         , output_(graph_, format_desc, channel_info_)
+         , image_mixer_(std::move(image_mixer))
+         , mixer_(index, graph_, image_mixer_)
+-        , stage_(std::make_shared<core::stage>(index, graph_, format_desc))
++        , stage_(std::make_shared<core::stage>(index, graph_, format_desc, tick))
+         , tick_(std::move(tick))
+     {
+         graph_->set_color("produce-time", caspar::diagnostics::color(0.0f, 1.0f, 0.0f));
